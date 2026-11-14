@@ -3,6 +3,8 @@
 Modules
   config.py   all settings (which asteroid or star, time window, ...)
   irsa.py     talking to IRSA: timeouts, retries, image search, catalogs, cutouts
+  cache.py    disk cache of downloads (fast re-runs), cleaned up automatically after every run
+  results.py  save / load each run's measurements as a small table (results/<target>.ecsv)
   moving.py   an asteroid: its path from JPL Horizons, and the SPHEREx images that caught it
   target.py   a star: pick the one to track and its catalog brightness
   frames.py   download + measure every image (placed by SPHEREx's pointing only); original-pixel zooms
