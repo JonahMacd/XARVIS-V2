@@ -1,0 +1,8 @@
+{
+    "Server_ping_freq_ms" : 100,
+    "Min_RAM_alloc_GB" : 1,
+    "Max_RAM_alloc_GB" : 8,
+    "image_compression" : false,
+    "pixel_window_width" : 29,
+    "pixel_wincow_height" : 29
+}

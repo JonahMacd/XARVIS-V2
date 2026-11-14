@@ -1,0 +1,927 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>XARVIS Solar System</title>
+<style>
+  :root { --bg:#04060b; --panel:#0d1220ec; --fg:#dbe4ff; --dim:#8a97b8; --accent:#ffb347; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+              font:14px/1.45 system-ui,Segoe UI,Roboto,sans-serif; overflow:hidden; }
+  canvas { position:absolute; inset:0; width:100%; height:100%; cursor:grab; touch-action:none; }
+  canvas.drag { cursor:grabbing; } canvas.hit { cursor:pointer; }
+  .panel { position:absolute; background:var(--panel); border:1px solid #243052; border-radius:10px;
+           padding:12px 14px; }
+  #info { top:16px; left:16px; width:310px; max-width:calc(100vw - 32px); }
+  #info h1 { margin:0 0 6px; font-size:16px; letter-spacing:.04em; }
+  #info h1 span { color:var(--accent); }
+  #info table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+  #info td { padding:1px 0; } #info td:first-child { color:var(--dim); padding-right:10px; white-space:nowrap; }
+  #info td:last-child { text-align:right; }
+  tr.skyonly { display:none; } body.sky tr.skyonly { display:table-row; }
+  #view { top:16px; right:16px; width:232px; display:flex; flex-direction:column; gap:8px; }
+  #view .row { display:flex; flex-wrap:wrap; gap:6px; }
+  #view label { color:var(--dim); font-size:13px; display:flex; align-items:center; gap:5px; margin-right:6px; }
+  #view input[type=checkbox] { accent-color:var(--accent); }
+  body.sky .only3d { display:none; }
+  #readout { color:var(--dim); font-size:12px; text-align:right; }
+  #controls { bottom:16px; left:50%; transform:translateX(-50%); display:flex; gap:10px; align-items:center;
+              width:min(760px, calc(100vw - 32px)); }
+  body.sky #controls { display:none; }
+  #controls input[type=range] { flex:1; accent-color:var(--accent); }
+  button { background:#1a2442; color:var(--fg); border:1px solid #2f3d6b; border-radius:7px;
+           padding:6px 11px; cursor:pointer; font:inherit; white-space:nowrap; }
+  button:hover { background:#25335e; } button.primary,button.on { background:var(--accent); color:#1a1000; border-color:var(--accent); }
+  #note { color:var(--dim); font-size:12px; margin-top:8px; }
+  #attr { position:absolute; bottom:6px; right:10px; color:#56627f; font-size:11px; }
+  #tip { pointer-events:none; display:none; padding:9px 12px; z-index:5; max-width:330px; font-size:13px; line-height:1.4;
+         border-color:#3b4d86; box-shadow:0 6px 24px #000a; }
+  #tip b { font-size:14px; } #tip .sub { color:var(--accent); font-size:11px; letter-spacing:.05em; text-transform:uppercase; margin-left:6px; }
+  #tip table { border-collapse:collapse; margin-top:4px; font-variant-numeric:tabular-nums; }
+  #tip td { padding:0 0 0 0; } #tip td:first-child { color:var(--dim); padding-right:12px; white-space:nowrap; }
+  #tip .note { color:var(--dim); font-size:12px; margin-top:5px; }
+  @media (max-width:760px) { #view { top:auto; bottom:72px; right:8px; } #info { width:240px; } }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div class="panel" id="info">
+  <h1>XARVIS <span>· SPHEREx locator</span></h1>
+  <table>
+    <tr><td>UTC</td><td id="utc">…</td></tr>
+    <tr><td>Helio. distance</td><td id="rsun">…</td></tr>
+    <tr><td>Ecliptic lon / lat</td><td id="lonlat">…</td></tr>
+    <tr><td>X, Y, Z (AU)</td><td id="xyz">…</td></tr>
+    <tr><td>Altitude</td><td id="alt">…</td></tr>
+    <tr><td>Orbit period</td><td id="per">…</td></tr>
+    <tr><td>Planet ephemeris</td><td id="eph">…</td></tr>
+    <tr><td>SPHEREx source</td><td id="src">…</td></tr>
+    <tr class="skyonly"><td>Looking at (RA / Dec)</td><td id="ctr">…</td></tr>
+    <tr class="skyonly"><td>Cursor (RA / Dec)</td><td id="cur">…</td></tr>
+  </table>
+  <div id="note"></div>
+</div>
+
+<div class="panel" id="view">
+  <div class="row">
+    <button id="mode" class="primary">Sky from SPHEREx</button>
+  </div>
+  <div class="row">
+    <button id="reset">Reset</button><button id="top">Top</button><button id="edge">Edge-on</button><button id="spin">Spin</button>
+  </div>
+  <div class="row">
+    <label><input type="checkbox" id="cStars" checked>Stars</label>
+    <label><input type="checkbox" id="cLines" checked>Constellations</label>
+    <label><input type="checkbox" id="cNames" checked>Names</label>
+    <label><input type="checkbox" id="cGrid">RA/Dec grid</label>
+    <label class="only3d"><input type="checkbox" id="cOrbits" checked>Orbits</label>
+    <label class="only3d"><input type="checkbox" id="cDwarfs" checked>Dwarf planets</label>
+    <label class="only3d"><input type="checkbox" id="cBelts" checked>Belts &amp; Trojans</label>
+    <label><input type="checkbox" id="cSurvey" checked>SPHEREx survey</label>
+  </div>
+  <div id="readout"></div>
+</div>
+
+<div class="panel" id="controls">
+  <button id="far" title="Zoom out past the solar system">Far out</button>
+  <button id="out">Solar system</button>
+  <input id="zoom" type="range" min="0" max="1" step="0.0005" value="0">
+  <button id="in" class="primary">Zoom to SPHEREx</button>
+</div>
+<div class="panel" id="tip"></div>
+<div id="attr"></div>
+<div id="perf" style="position:absolute;left:10px;bottom:6px;color:#7cffb0;font:11px monospace;display:none"></div>
+
+<script>
+const AU_KM = 149597870.7, D2R = Math.PI/180, EPS = 23.439281*D2R, EARTH_R_KM = 6371;
+const COLORS = {Mercury:'#b5b5b5', Venus:'#e8cda2', Earth:'#4da3ff', Mars:'#e2724b',
+                Jupiter:'#d9b38c', Saturn:'#e6d3a1', Uranus:'#8fe3e8', Neptune:'#5b7bff', Moon:'#c9c9c9',
+                Ceres:'#b8ad9b', Pluto:'#d9b98c', Haumea:'#e8e8f4', Makemake:'#d08a62', Eris:'#e2e2e2'};
+const DWARF_NOTE = {
+  Ceres: 'Largest object in the main asteroid belt.', Pluto: 'Kuiper-belt dwarf planet; orbit crosses Neptune\'s.',
+  Haumea: 'Fast-spinning, elongated Kuiper-belt object.', Makemake: 'Bright Kuiper-belt dwarf planet.',
+  Eris: 'Most massive dwarf planet; scattered-disc object.' };
+const cv = document.getElementById('c'), mainCtx = cv.getContext('2d');
+let ctx = mainCtx;                // drawing target; temporarily the cached layers while they are rebuilt
+const $ = id => document.getElementById(id);
+let W, H, DPR = 1, K = 1, resScale = 1;   // K = canvas pixels per CSS pixel
+let state = null, orbits = null, dwarfOrbits = null, sky = null;
+let mode = '3d';                  // '3d' | 'sky'
+let zt = 0, ztGoal = 0, anim = null;     // 3D zoom (eased toward ztGoal); set to tFit() at start
+let skyFov = 1, skyGoal = 1;      // sky-mode zoom factor (eased)
+let spin = false, dragging = false;
+let cursor = null;                // mouse position
+let hits = [];                    // hoverable things registered during the frame
+
+// option checkboxes cached in an object (reading .checked from the DOM every frame is wasteful)
+const opt = {};
+for (const id of ['cStars','cLines','cNames','cGrid','cOrbits','cDwarfs','cBelts','cSurvey']) {
+  opt[id] = $(id).checked; $(id).addEventListener('change', () => { opt[id] = $(id).checked; });
+}
+// DOM writes only when the text actually changed (a write every frame forces layout)
+const txt = {};
+const setText = (id, v) => { if (txt[id] !== v) { txt[id] = v; $(id).textContent = v; } };
+const setHTML = (id, v) => { if (txt[id] !== v) { txt[id] = v; $(id).innerHTML = v; } };
+
+// ------------------------------------------------------------------ maths ---
+const dot = (a,b) => a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+const cross = (a,b) => [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]];
+const norm = a => { const n = Math.hypot(a[0],a[1],a[2]) || 1; return [a[0]/n,a[1]/n,a[2]/n]; };
+const sub = (a,b) => [a[0]-b[0],a[1]-b[1],a[2]-b[2]];
+const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+const smooth = (a, b, x) => { const t = clamp((x - a)/(b - a), 0, 1); return t*t*(3 - 2*t); };
+
+// Orientation R: rows are the screen's right, up and toward-camera axes expressed in the
+// heliocentric ecliptic frame. A full rotation matrix, so every orientation (incl. roll) is allowed.
+function matFromYawPitch(yaw, pitch) {
+  const r0 = [Math.cos(yaw), -Math.sin(yaw), 0];
+  const r1 = [Math.sin(pitch)*Math.sin(yaw), Math.sin(pitch)*Math.cos(yaw), Math.cos(pitch)];
+  return [r0, r1, cross(r0, r1)];
+}
+function lookAt(f, upHint) {                 // camera looks along unit vector f
+  const z = [-f[0], -f[1], -f[2]];
+  if (Math.abs(dot(f, upHint)) > 0.99) upHint = [1,0,0];
+  const x = norm(cross(upHint, z));
+  return [x, cross(z, x), z];
+}
+let R = matFromYawPitch(-0.5, 1.0);
+function orthonormalize() {
+  const r0 = norm(R[0]); let r1 = R[1]; const d = dot(r1, r0);
+  r1 = norm([r1[0]-d*r0[0], r1[1]-d*r0[1], r1[2]-d*r0[2]]);
+  R = [r0, r1, cross(r0, r1)];
+}
+function applyView(M) {                      // R = M · R   (M acts in view space)
+  R = [0,1,2].map(i => [0,1,2].map(j => M[i][0]*R[0][j] + M[i][1]*R[1][j] + M[i][2]*R[2][j]));
+  orthonormalize();
+}
+const Ry = a => [[Math.cos(a),0,Math.sin(a)],[0,1,0],[-Math.sin(a),0,Math.cos(a)]];
+const Rx = b => [[1,0,0],[0,Math.cos(b),-Math.sin(b)],[0,Math.sin(b),Math.cos(b)]];
+const Rz = c => [[Math.cos(c),-Math.sin(c),0],[Math.sin(c),Math.cos(c),0],[0,0,1]];
+function rotateBy(dx, dy, roll) {
+  const k = mode === 'sky' ? -1 : 1;         // sky mode: "grab the sky"
+  if (dx) applyView(Ry(k*dx));
+  if (dy) applyView(Rx(k*dy));
+  if (roll) applyView(Rz(roll));
+}
+const toView = v => [dot(R[0],v), dot(R[1],v), dot(R[2],v)];
+const fromView = v => [R[0][0]*v[0]+R[1][0]*v[1]+R[2][0]*v[2],
+                       R[0][1]*v[0]+R[1][1]*v[1]+R[2][1]*v[2],
+                       R[0][2]*v[0]+R[1][2]*v[1]+R[2][2]*v[2]];
+
+// equatorial <-> ecliptic (J2000); angles in radians
+function eq2ecl(ra, dec) {
+  const x = Math.cos(dec)*Math.cos(ra), y = Math.cos(dec)*Math.sin(ra), z = Math.sin(dec);
+  return [x, y*Math.cos(EPS) + z*Math.sin(EPS), -y*Math.sin(EPS) + z*Math.cos(EPS)];
+}
+function ecl2eq(v) {
+  const y = v[1]*Math.cos(EPS) - v[2]*Math.sin(EPS), z = v[1]*Math.sin(EPS) + v[2]*Math.cos(EPS);
+  return [(Math.atan2(y, v[0]) / D2R + 360) % 360, Math.asin(clamp(z, -1, 1)) / D2R];
+}
+const fmtRA = d => { const h = d/15, hh = Math.floor(h), mm = Math.floor((h-hh)*60);
+  return String(hh).padStart(2,'0') + 'h ' + String(mm).padStart(2,'0') + 'm'; };
+const fmtDec = d => (d<0?'−':'+') + Math.abs(d).toFixed(2) + '°';
+const fmtRADec = v => { const [ra, dec] = ecl2eq(v); return fmtRA(ra) + ' / ' + fmtDec(dec); };
+
+// ----------------------------------------------------- canvas resolution ---
+// K canvas pixels per CSS pixel. Starts at the display's density (max 2) and is lowered
+// automatically if the machine cannot hold a smooth frame rate (see frame()).
+function applyRes() {
+  W = innerWidth; H = innerHeight;
+  K = Math.max(0.6, DPR*resScale);
+  cv.width = Math.round(W*K); cv.height = Math.round(H*K);
+  mainCtx.setTransform(K, 0, 0, K, 0, 0);
+  layers.starKey = layers.lineKey = '';
+}
+function resize() { DPR = Math.min(window.devicePixelRatio || 1, 2); applyRes(); }
+
+// ------------------------------------------------------- cached sky layers ---
+// While you zoom or sit still, the star and constellation images don't change, so they are
+// painted once into off-screen canvases and just copied to the screen each frame.
+const layers = {stars: null, lines: null, starKey: '', lineKey: ''};
+const _q = new URLSearchParams(location.search);
+// Cached layers (?ls=1&ll=1) measured *slower* than painting directly (a full-screen copy per frame costs
+// more than ~5000 batched stars), so painting directly is the default.
+let LAYER_STARS = _q.get('ls') === '1', LAYER_LINES = _q.get('ll') === '1';
+function ensureLayer(name) {
+  let l = layers[name];
+  if (!l || l.width !== cv.width || l.height !== cv.height) {
+    l = layers[name] = document.createElement('canvas'); l.width = cv.width; l.height = cv.height; layers[name + 'Key'] = '';
+  }
+  return l;
+}
+function renderTo(layer, fn) {
+  const g = layer.getContext('2d');
+  g.setTransform(1, 0, 0, 1, 0, 0); g.clearRect(0, 0, layer.width, layer.height); g.setTransform(K, 0, 0, K, 0, 0);
+  const prev = ctx; ctx = g;
+  try { fn(); } finally { ctx = prev; }
+}
+function blit(layer, alpha) {
+  ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = alpha; ctx.drawImage(layer, 0, 0); ctx.restore();
+}
+const rKey = () => R[0].concat(R[1], R[2]).map(v => v.toFixed(5)).join();
+
+// -------------------------------------------------------- 3D solar system ---
+const sFit = () => Math.min(W, H)/2/36;               // px/AU: Neptune's orbit just fits
+const sFar = () => sFit()/40;                         // zoomed far out: ~4000 AU across
+const sMax = () => 2.2e6 * Math.min(W, H)/800;        // px/AU: SPHEREx orbit ~110 px
+const scaleOf = t => sFar()*Math.pow(sMax()/sFar(), t);
+const tFit = () => Math.log(sFit()/sFar())/Math.log(sMax()/sFar());   // slider position of "whole solar system"
+function centerOf(s) {                                // zoom about SPHEREx (only below the solar-system scale)
+  if (!state) return [0,0,0];
+  const p = state.spherex.pos, k = Math.max(0, 1 - sFit()/s);
+  return [p[0]*k, p[1]*k, p[2]*k];
+}
+const constellationFade = s => smooth(sFit()*0.7, sFit()*0.12, s);   // 0 over the solar system, 1 well beyond it
+function project(p, c, s) {                           // -> [x, y, depthTowardCamera]
+  const v = toView([p[0]-c[0], p[1]-c[1], p[2]-c[2]]);
+  return [W/2 + v[0]*s, H/2 - v[1]*s, v[2]];
+}
+function fmtLen(au) {
+  const km = au*AU_KM;
+  if (au >= 0.1) return au.toFixed(2) + ' AU';
+  if (km >= 1e6) return (km/1e6).toFixed(2) + ' million km';
+  return Math.round(km).toLocaleString() + ' km';
+}
+
+// ----------------------------------------------------------- hover / tips ---
+// `html` may be a function: the tooltip text is only built for the one object under the cursor.
+function addHit(x, y, r, prio, html) {
+  if (x < -20 || x > W+20 || y < -20 || y > H+20) return;
+  hits.push({x, y, r: Math.max(r, 8), prio, html});
+}
+function tipHTML(title, kind, rows, note) {
+  return `<b>${title}</b>${kind ? `<span class="sub">${kind}</span>` : ''}` +
+    (rows.length ? '<table>' + rows.map(r => `<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join('') + '</table>' : '') +
+    (note ? `<div class="note">${note}</div>` : '');
+}
+function distStr(au) { return au < 0.02 ? Math.round(au*AU_KM).toLocaleString() + ' km' : au.toFixed(3) + ' AU'; }
+// Rows for an object at heliocentric ecliptic position `pos`, seen from `viewer` (Earth or SPHEREx)
+function bodyRows(pos, viewer, viewerName, withHelio = true) {
+  const r = Math.hypot(...pos), rows = [];
+  if (withHelio) {
+    rows.push(['Heliocentric r', r.toFixed(3) + ' AU']);
+    rows.push(['Ecl. lon / lat', ((Math.atan2(pos[1], pos[0])/D2R + 360) % 360).toFixed(2) + '° / ' + (Math.asin(pos[2]/r)/D2R).toFixed(2) + '°']);
+    rows.push(['X, Y, Z (AU)', pos.map(v => v.toFixed(3)).join(', ')]);
+  }
+  if (viewer) {
+    const v = sub(pos, viewer), d = Math.hypot(...v);
+    if (d > 1e-12) { rows.push(['From ' + viewerName, distStr(d)]); rows.push(['RA / Dec (J2000)', fmtRADec(norm(v))]); }
+  }
+  return rows;
+}
+let lastReadout = 0;
+function setReadout(html) { const t = performance.now(); if (t - lastReadout > 120) { lastReadout = t; setHTML('readout', html); } }
+let tipShown = '';
+function pickHit() {
+  const tip = $('tip');
+  let best = null, bs = 1e9;
+  if (cursor && !dragging) for (const h of hits) {
+    const d = Math.hypot(h.x - cursor[0], h.y - cursor[1]);
+    if (d <= h.r) { const sc = d/h.r - h.prio; if (sc < bs) { bs = sc; best = h; } }
+  }
+  cv.classList.toggle('hit', !!best);
+  if (!best) { if (tipShown !== '') { tip.style.display = 'none'; tipShown = ''; } return; }
+  const html = typeof best.html === 'function' ? best.html() : best.html;
+  if (html !== tipShown) { tip.innerHTML = html; tipShown = html; tip.style.display = 'block'; }
+  const w = tip.offsetWidth, h = tip.offsetHeight;
+  tip.style.left = Math.min(W - w - 8, cursor[0] + 16) + 'px';
+  tip.style.top = Math.min(H - h - 8, cursor[1] + 16) + 'px';
+}
+
+// glow sprites replace shadowBlur (which is very slow on large canvases)
+const glowCache = {};
+function drawGlow(x, y, r, col) {
+  let c = glowCache[col];
+  if (!c) {
+    c = glowCache[col] = document.createElement('canvas'); c.width = c.height = 64;
+    const g = c.getContext('2d'), gr = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+    gr.addColorStop(0, col + 'ff'); gr.addColorStop(.25, col + '88'); gr.addColorStop(1, col + '00');
+    g.fillStyle = gr; g.fillRect(0, 0, 64, 64);
+  }
+  ctx.drawImage(c, x - r, y - r, 2*r, 2*r);
+}
+
+// --------------------------------------------------------------- sky data ---
+const BIN_COL = ['#9bb0ff','#cad8ff','#f8f7ff','#fff4e8','#ffe7bf','#ffd2a1','#ffb878','#ff9e5e'];
+async function loadSky() {
+  const d = await (await fetch('/static/sky.json')).json();
+  const n = d.stars.length, v = new Float32Array(n*3), r = new Float32Array(n), bins = BIN_COL.map(() => []);
+  const key = new Map(), bright = [];
+  d.stars.forEach(([ra, dec, mag, bv], i) => {
+    const e = eq2ecl(ra*D2R, dec*D2R); v.set(e, i*3);
+    r[i] = Math.max(0.55, 2.8 - 0.42*mag);
+    bins[clamp(Math.round((bv + 0.3)/0.3), 0, 7)].push(i);
+    key.set(ra + ',' + dec, i); if (mag <= 4.6) bright.push(i);
+  });
+  const nameOf = new Map();
+  d.names.forEach(([ra, dec, name]) => { const i = key.get(ra + ',' + dec); if (i !== undefined) nameOf.set(i, name); });
+  sky = {
+    v, r, bins: bins.map(b => Int32Array.from(b)), bright, nameOf, mag: d.stars.map(s => s[2]), bv: d.stars.map(s => s[3]),
+    lines: d.lines.map(l => l.map(([ra, dec]) => eq2ecl(ra*D2R, dec*D2R))),
+    names: d.names.map(([ra, dec, name, mag]) => ({v: eq2ecl(ra*D2R, dec*D2R), name, mag})),
+    labels: d.labels.map(([ra, dec, name]) => ({v: eq2ecl(ra*D2R, dec*D2R), name})),
+  };
+  $('attr').textContent = d.attribution;
+  layers.starKey = layers.lineKey = '';
+}
+
+// Stereographic projection about the look axis (-z in view space). Works for any orientation.
+const skyScale = () => 0.7*Math.max(W, H)*(mode === 'sky' ? skyFov : 1);
+function skyXY(v, SK, clampIt) {                      // v = view-space unit vector
+  let a = -v[2];
+  if (a < -0.9) { if (!clampIt) return null; a = -0.97; }
+  const k = SK/(1 + a);
+  return [W/2 + v[0]*k, H/2 - v[1]*k];
+}
+function drawGreatPath(pts, SK) {                     // polyline of ecliptic-frame unit vectors
+  let pen = false, lx = 0, ly = 0;
+  for (const p of pts) {
+    const q = skyXY(toView(p), SK);
+    if (!q) { pen = false; continue; }
+    if (pen && Math.hypot(q[0]-lx, q[1]-ly) < Math.max(W, H)) ctx.lineTo(q[0], q[1]); else ctx.moveTo(q[0], q[1]);
+    pen = true; lx = q[0]; ly = q[1];
+  }
+}
+function smallCircle(center, radDeg, n = 120) {       // unit vectors on a circle of angular radius radDeg
+  const c = norm(center), p1 = norm(cross(c, Math.abs(c[2]) < 0.9 ? [0,0,1] : [1,0,0])), p2 = cross(c, p1);
+  const a = radDeg*D2R, out = [];
+  for (let i = 0; i <= n; i++) {
+    const f = i/n*2*Math.PI;
+    out.push([0,1,2].map(k => Math.cos(a)*c[k] + Math.sin(a)*(Math.cos(f)*p1[k] + Math.sin(f)*p2[k])));
+  }
+  return out;
+}
+
+const NEP = [0, 0, 1], SEP = [0, 0, -1];               // ecliptic poles = SPHEREx Deep Field centres
+const DEEP_RADIUS_DEG = Math.sqrt(100/Math.PI);        // each Deep Field is ~100 sq. deg.
+
+function paintStars(SK, sf) {
+  const v = sky.v, R0 = R[0], R1 = R[1], R2 = R[2], hw = W/2, hh = H/2;
+  sky.bins.forEach((idx, b) => {
+    ctx.fillStyle = BIN_COL[b]; ctx.beginPath();
+    for (let j = 0; j < idx.length; j++) {
+      const i = idx[j], x = v[i*3], y = v[i*3+1], z = v[i*3+2];
+      const a = -(R2[0]*x + R2[1]*y + R2[2]*z);
+      if (a < -0.9) continue;
+      const k = SK/(1 + a), px = hw + (R0[0]*x + R0[1]*y + R0[2]*z)*k, py = hh - (R1[0]*x + R1[1]*y + R1[2]*z)*k;
+      if (px < -6 || px > W+6 || py < -6 || py > H+6) continue;
+      const r = sky.r[i]*sf;
+      if (r < 1) ctx.rect(px - r, py - r, 2*r, 2*r); else { ctx.moveTo(px + r, py); ctx.arc(px, py, r, 0, 6.2832); }
+    }
+    ctx.fill();
+  });
+}
+function paintLines(SK) {
+  if (opt.cGrid && mode === 'sky') {                   // RA/Dec grid
+    ctx.strokeStyle = '#3a4f8a'; ctx.lineWidth = 0.7; ctx.beginPath();
+    for (let dec = -60; dec <= 60; dec += 30) {
+      const pts = []; for (let ra = 0; ra <= 360; ra += 3) pts.push(eq2ecl(ra*D2R, dec*D2R));
+      drawGreatPath(pts, SK);
+    }
+    for (let ra = 0; ra < 360; ra += 30) {
+      const pts = []; for (let dec = -88; dec <= 88; dec += 4) pts.push(eq2ecl(ra*D2R, dec*D2R));
+      drawGreatPath(pts, SK);
+    }
+    ctx.stroke();
+    ctx.fillStyle = '#5b72b8'; ctx.font = '11px system-ui';
+    for (let ra = 0; ra < 360; ra += 30) {
+      const q = skyXY(toView(eq2ecl(ra*D2R, 0)), SK);
+      if (q && q[0] > 0 && q[0] < W && q[1] > 0 && q[1] < H) ctx.fillText(ra/15 + 'h', q[0] + 3, q[1] - 3);
+    }
+  }
+  if (mode === 'sky') {                                // ecliptic
+    ctx.strokeStyle = '#a8742a'; ctx.lineWidth = 1; ctx.setLineDash([6, 5]); ctx.beginPath();
+    const pts = []; for (let t = 0; t <= 360; t += 2) pts.push([Math.cos(t*D2R), Math.sin(t*D2R), 0]);
+    drawGreatPath(pts, SK); ctx.stroke(); ctx.setLineDash([]);
+  }
+  if (opt.cLines) {
+    ctx.strokeStyle = '#4a6fb0'; ctx.lineWidth = 1; ctx.beginPath();
+    for (const l of sky.lines) drawGreatPath(l, SK);
+    ctx.stroke();
+  }
+  if (opt.cNames) {
+    ctx.font = 'italic 11px system-ui'; ctx.fillStyle = '#5f7fc0';
+    for (const l of sky.labels) {
+      const q = skyXY(toView(l.v), SK);
+      if (q && q[0] > 0 && q[0] < W && q[1] > 0 && q[1] < H) ctx.fillText(l.name, q[0] - 18, q[1]);
+    }
+    ctx.font = '11px system-ui'; ctx.fillStyle = '#c9d6ff';
+    for (const s of sky.names) {
+      const q = skyXY(toView(s.v), SK);
+      if (q && q[0] > 0 && q[0] < W && q[1] > 0 && q[1] < H) ctx.fillText(s.name, q[0] + 6, q[1] - 5);
+    }
+  }
+}
+
+function drawStarfield(alpha, fade = 1) {
+  if (!sky) return;
+  const SK = skyScale(), sf = mode === 'sky' ? clamp(Math.sqrt(skyFov), 1, 2.5) : 1;
+  const base = [W, H, K, mode, mode === 'sky' ? skyFov.toFixed(3) : '', rKey()].join('|');
+
+  if (opt.cStars) {
+    if (!LAYER_STARS) { ctx.globalAlpha = alpha; paintStars(SK, sf); ctx.globalAlpha = 1; }
+    else {
+      const layer = ensureLayer('stars'), key = base + opt.cStars;
+      if (layers.starKey !== key) { renderTo(layer, () => paintStars(SK, sf)); layers.starKey = key; }
+      blit(layer, alpha);
+    }
+  }
+  const wantLines = opt.cLines || opt.cNames || mode === 'sky';
+  if (wantLines && fade > 0.01) {                      // constellations fade in as you zoom out of the solar system
+    if (!LAYER_LINES) { ctx.globalAlpha = alpha*fade; paintLines(SK); ctx.globalAlpha = 1; }
+    else {
+      const layer = ensureLayer('lines'), key = base + [opt.cLines, opt.cNames, opt.cGrid].join();
+      if (layers.lineKey !== key) { renderTo(layer, () => paintLines(SK)); layers.lineKey = key; }
+      blit(layer, alpha*fade);
+    }
+  }
+  if (opt.cStars && cursor) {                          // hover targets: the brighter stars (cheap, no allocation)
+    const v = sky.v, R0 = R[0], R1 = R[1], R2 = R[2];
+    for (const i of sky.bright) {
+      const x = v[i*3], y = v[i*3+1], z = v[i*3+2], a = -(R2[0]*x + R2[1]*y + R2[2]*z);
+      if (a < -0.9) continue;
+      const k = SK/(1 + a), px = W/2 + (R0[0]*x + R0[1]*y + R0[2]*z)*k, py = H/2 - (R1[0]*x + R1[1]*y + R1[2]*z)*k;
+      if (Math.abs(px - cursor[0]) > 10 || Math.abs(py - cursor[1]) > 10) continue;
+      const nm = sky.nameOf.get(i), e = [x, y, z];
+      addHit(px, py, 8, 0, () => tipHTML(nm || 'Star', 'star', [
+        ['RA / Dec (J2000)', fmtRADec(e)],
+        ['Ecl. lon / lat', ((Math.atan2(e[1], e[0])/D2R + 360) % 360).toFixed(2) + '° / ' + (Math.asin(e[2])/D2R).toFixed(2) + '°'],
+        ['Magnitude', sky.mag[i].toFixed(2)], ['B−V colour', sky.bv[i].toFixed(2)]], 'Hipparcos / Tycho catalogue position.'));
+    }
+  }
+}
+
+// -------------------------------------------- belts, Trojans (illustrative) ---
+function mulberry(a) { return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0)/4294967296; }; }
+const gauss = rnd => { let u = 0; while (!u) u = rnd(); const v = rnd(); return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v); };
+// Static point clouds in flat typed arrays (no per-frame allocation)
+const REGIONS = (() => {
+  const rnd = mulberry(7);
+  const cloud = (n, f) => { const x = new Float32Array(n), y = new Float32Array(n), z = new Float32Array(n);
+    for (let i = 0; i < n; i++) { const p = f(); x[i] = p[0]; y[i] = p[1]; z[i] = p[2]; } return {n, x, y, z}; };
+  const zOf = (r, deg) => r*Math.tan(deg*D2R*Math.abs(gauss(rnd)))*(rnd() < .5 ? -1 : 1);
+  return {
+    belt: cloud(4500, () => { const r = clamp(2.7 + 0.35*gauss(rnd), 2.1, 3.3), th = rnd()*6.2832; return [r*Math.cos(th), r*Math.sin(th), zOf(r, 8)]; }),
+    kuiper: cloud(3000, () => { const r = clamp(41 + 5*gauss(rnd), 30, 50), th = rnd()*6.2832; return [r*Math.cos(th), r*Math.sin(th), zOf(r, 10)]; }),
+    trojan: cloud(1000, () => { const r = 5.2 + 0.18*gauss(rnd), th = 9*D2R*gauss(rnd); return [r*Math.cos(th), r*Math.sin(th), zOf(r, 9)]; }),
+  };
+})();
+function drawRegions(c, s) {
+  if (!opt.cBelts || W/s < 0.5) return;
+  const J = state.byName.Jupiter.pos, lj = Math.atan2(J[1], J[0]);
+  const R0 = R[0], R1 = R[1], hw = W/2, hh = H/2, sz = 1.2 + Math.min(1.1, 0.5*Math.log2(Math.max(1, s/sFit())));
+  const s2 = s*s;
+  // level of detail: never draw more dots than the on-screen area can show
+  const strideFor = (n, areaAU2) => Math.max(1, Math.floor(n/clamp(areaAU2*s2/5, 150, n)));
+  const plot = (cl, stride, col, alpha, rot) => {
+    ctx.fillStyle = col; ctx.globalAlpha = alpha; ctx.beginPath();
+    const ca = rot === undefined ? 1 : Math.cos(rot), sa = rot === undefined ? 0 : Math.sin(rot);
+    for (let i = 0; i < cl.n; i += stride) {
+      const x = cl.x[i]*ca - cl.y[i]*sa - c[0], y = cl.x[i]*sa + cl.y[i]*ca - c[1], z = cl.z[i] - c[2];
+      const px = hw + (R0[0]*x + R0[1]*y + R0[2]*z)*s, py = hh - (R1[0]*x + R1[1]*y + R1[2]*z)*s;
+      if (px > -4 && px < W + 4 && py > -4 && py < H + 4) ctx.rect(px, py, sz, sz);
+    }
+    ctx.fill(); ctx.globalAlpha = 1;
+  };
+  plot(REGIONS.belt, strideFor(REGIONS.belt.n, Math.PI*(3.3*3.3 - 2.1*2.1)), '#c2a173', 0.55);
+  plot(REGIONS.kuiper, strideFor(REGIONS.kuiper.n, Math.PI*(50*50 - 30*30)), '#7a9ccc', 0.45);
+  for (const side of [1, -1]) plot(REGIONS.trojan, strideFor(REGIONS.trojan.n, 2), '#e2a45f', 0.7, lj + side*Math.PI/3);
+
+  const [sx0, sy0] = project([0,0,0], c, s);
+  const label = (name, r, th, col, html) => {
+    const q = project([r*Math.cos(th), r*Math.sin(th), 0], c, s);
+    if (q[0] < 0 || q[0] > W || q[1] < 0 || q[1] > H) return;
+    if (Math.hypot(q[0] - sx0, q[1] - sy0) > 45) { ctx.fillStyle = col; ctx.font = 'italic 12px system-ui'; ctx.fillText(name, q[0] + 6, q[1]); }
+    addHit(q[0], q[1], 16, -0.3, html);
+  };
+  const note = 'Illustrative density only: dots are a random sample, not individual objects. ' +
+               'SPHEREx finds objects like these as sources that move between its repeated scans.';
+  label('Main asteroid belt', 2.7, 0.5, '#d8b987', () => tipHTML('Main asteroid belt', 'region',
+    [['Distance from Sun', '2.1 – 3.3 AU'], ['Contains', 'Ceres + ~1 million rocks > 1 km']], note));
+  label('Kuiper belt', 41, 2.2, '#8fb0dd', () => tipHTML('Kuiper belt', 'region',
+    [['Distance from Sun', '30 – 50 AU'], ['Contains', 'Pluto, Haumea, Makemake']], note));
+  label('Jupiter Trojans (L4)', 5.2, lj + Math.PI/3, '#e8b070', () => tipHTML('Jupiter Trojans L4', 'region',
+    [['Location', '60° ahead of Jupiter'], ['Distance from Sun', '≈ 5.2 AU']], note));
+  label('Jupiter Trojans (L5)', 5.2, lj - Math.PI/3, '#e8b070', () => tipHTML('Jupiter Trojans L5', 'region',
+    [['Location', '60° behind Jupiter'], ['Distance from Sun', '≈ 5.2 AU']], note));
+}
+
+// ------------------------------------------------------------- 3D drawing ---
+// Zoomed in, an orbit is a path millions of pixels across of which only a sliver is on screen. Rasterising
+// the whole thing (worse, with dashes) was the cause of the stutter, so every segment is clipped to the
+// viewport first (Liang-Barsky) and segments entirely off-screen are dropped.
+const MARGIN = 40;
+function clipSeg(x0, y0, x1, y1) {                     // -> [x0,y0,x1,y1] clipped to the viewport, or null
+  const xmin = -MARGIN, xmax = W + MARGIN, ymin = -MARGIN, ymax = H + MARGIN;
+  const dx = x1 - x0, dy = y1 - y0; let t0 = 0, t1 = 1;
+  const p = [-dx, dx, -dy, dy], q = [x0 - xmin, xmax - x0, y0 - ymin, ymax - y0];
+  for (let i = 0; i < 4; i++) {
+    if (p[i] === 0) { if (q[i] < 0) return null; }
+    else { const r = q[i]/p[i];
+      if (p[i] < 0) { if (r > t1) return null; if (r > t0) t0 = r; } else { if (r < t0) return null; if (r < t1) t1 = r; } }
+  }
+  return [x0 + t0*dx, y0 + t0*dy, x0 + t1*dx, y0 + t1*dy];
+}
+const onScr = (x, y) => x >= -MARGIN && x <= W + MARGIN && y >= -MARGIN && y <= H + MARGIN;
+// Adds line segments to the current path with clipping; remembers the pen position between calls.
+function makePen() {
+  let has = false, lx = 0, ly = 0;
+  return {
+    gap() { has = false; },
+    line(x0, y0, x1, y1) {
+      const seg = onScr(x0, y0) && onScr(x1, y1) ? [x0, y0, x1, y1] : clipSeg(x0, y0, x1, y1);
+      if (!seg) { has = false; return; }
+      if (!has || seg[0] !== lx || seg[1] !== ly) ctx.moveTo(seg[0], seg[1]);
+      ctx.lineTo(seg[2], seg[3]); lx = seg[2]; ly = seg[3]; has = true;
+    },
+  };
+}
+// Draws a closed path of heliocentric points with inline projection. `stride` thins the point list
+// when the path is tiny on screen.
+function polyline(pts, c, s, stride = 1) {
+  const R0 = R[0], R1 = R[1], hw = W/2, hh = H/2, n = pts.length, pen = makePen();
+  ctx.beginPath();
+  let px = 0, py = 0, first = true;
+  const at = i => { const p = pts[i], dx = p[0]-c[0], dy = p[1]-c[1], dz = p[2]-c[2];
+    return [hw + (R0[0]*dx + R0[1]*dy + R0[2]*dz)*s, hh - (R1[0]*dx + R1[1]*dy + R1[2]*dz)*s]; };
+  for (let i = 0; i < n; i += stride) {
+    const [x, y] = at(i);
+    if (!first) pen.line(px, py, x, y);
+    px = x; py = y; first = false;
+  }
+  if ((n - 1) % stride) { const [x, y] = at(n - 1); pen.line(px, py, x, y); }
+  ctx.stroke();
+}
+const maxR = pts => { let m = 0; for (const p of pts) m = Math.max(m, Math.hypot(p[0], p[1], p[2])); return m; };
+function strokeOrbits(set, radii, c, s, colourSuffix) {
+  for (const name in set) {
+    const perim = 2*Math.PI*(radii[name] || 1)*s;          // on-screen circumference in px
+    if (perim < 8) continue;                               // too small to see
+    ctx.strokeStyle = COLORS[name] + colourSuffix;
+    polyline(set[name], c, s, clamp(Math.floor(3*set[name].length/perim), 1, 16));
+  }
+}
+
+function draw3D() {
+  const s = scaleOf(zt), c = centerOf(s), fade = constellationFade(s);
+  drawStarfield(0.75, fade);
+  const E = state.E, sp = state.spherex, wAU = W/s;
+  const orbitA = smooth(0.004, 0.03, wAU);               // orbit lines are meaningless once zoomed into Earth
+
+  drawRegions(c, s);
+
+  if (orbits && opt.cOrbits && orbitA > 0.01) {
+    ctx.lineWidth = 1; ctx.globalAlpha = orbitA;
+    strokeOrbits(orbits, orbitRadii(orbits), c, s, '55');
+    if (dwarfOrbits && opt.cDwarfs) { ctx.setLineDash([4, 5]); strokeOrbits(dwarfOrbits, orbitRadii(dwarfOrbits), c, s, '66'); ctx.setLineDash([]); }
+    ctx.globalAlpha = 1;
+  }
+
+  // Sun
+  const [sx, sy] = project([0,0,0], c, s), sunR = Math.max(5, 695700/AU_KM*s);
+  const sunVisible = sx + sunR*3.2 > 0 && sx - sunR*3.2 < W && sy + sunR*3.2 > 0 && sy - sunR*3.2 < H;
+  if (sunVisible) {
+    if (sunR < 1500) drawGlow(sx, sy, Math.max(sunR*3.2, 18), '#ffb300');
+    ctx.fillStyle = '#ffd35a'; ctx.beginPath(); ctx.arc(sx, sy, sunR, 0, 7); ctx.fill();
+  }
+  addHit(sx, sy, sunR, 0.2, () => tipHTML('Sun', 'star', [['Position', 'origin of the frame'],
+    ['From Earth', distStr(Math.hypot(...E))], ['RA / Dec (J2000)', fmtRADec(norm([-E[0], -E[1], -E[2]]))]]));
+
+  // SPHEREx orbit: far half is drawn before Earth, near half after, so Earth really occludes it
+  const ringPx = 4.7e-5*s, moonPx = 2.6e-3*s;               // on-screen radii of SPHEREx's orbit and the Moon's
+  const ringPts = state.ringAbs, R2 = R[2];
+  const ringHalf = front => {
+    if (ringPx < 2.5) return;
+    ctx.strokeStyle = front ? '#ff7a59' : '#a64a35'; ctx.lineWidth = 1.5; ctx.beginPath();
+    const R0 = R[0], R1 = R[1], pen = makePen(); let px = 0, py = 0, prevOk = false;
+    for (let i = 0; i < ringPts.length; i++) {
+      const o = sp.ring[i];
+      if (((R2[0]*o[0] + R2[1]*o[1] + R2[2]*o[2]) >= 0) !== front) { prevOk = false; pen.gap(); continue; }
+      const p = ringPts[i], dx = p[0]-c[0], dy = p[1]-c[1], dz = p[2]-c[2];
+      const x = W/2 + (R0[0]*dx + R0[1]*dy + R0[2]*dz)*s, y = H/2 - (R1[0]*dx + R1[1]*dy + R1[2]*dz)*s;
+      if (prevOk) pen.line(px, py, x, y);
+      px = x; py = y; prevOk = true;
+    }
+    ctx.stroke();
+  };
+  ringHalf(false);
+
+  if (state.moonAbs && opt.cOrbits && moonPx > 4) {         // Moon's orbit around Earth
+    ctx.strokeStyle = '#8a8a8a88'; ctx.lineWidth = 1; polyline(state.moonAbs, c, s);
+  }
+
+  // planets, Moon, dwarf planets
+  let earthXY = null;
+  for (const p of state.bodies) {
+    if (p.dwarf && !opt.cDwarfs) continue;
+    const [x, y] = project(p.pos, c, s), r = Math.max(p.dwarf ? 3.5 : 3, p.radius_km/AU_KM*s);
+    if (p.name === 'Earth') earthXY = [x, y, r];
+    if (x < -r-50 || x > W+r+50 || y < -r-50 || y > H+r+50) continue;
+    if (p.name === 'Earth' && r > 8) {                 // lit from the Sun's direction
+      const sv = toView(state.sun_dir);
+      const g = ctx.createRadialGradient(x + sv[0]*r*.5, y - sv[1]*r*.5, r*.05, x, y, r*1.02);
+      g.addColorStop(0, '#7cc0ff'); g.addColorStop(.55, '#2b6fc4'); g.addColorStop(1, '#0a1e3d');
+      ctx.fillStyle = g;
+    } else ctx.fillStyle = COLORS[p.name];
+    ctx.beginPath();
+    if (p.dwarf && r < 12) { const d = Math.max(r, 4.5); ctx.moveTo(x, y - d); ctx.lineTo(x + d, y); ctx.lineTo(x, y + d); ctx.lineTo(x - d, y); ctx.closePath(); }
+    else ctx.arc(x, y, Math.min(r, 1e5), 0, 7);
+    ctx.fill();
+    const nearSun = Math.hypot(x - sx, y - sy) < 22;        // avoid a pile of overlapping labels
+    if (p.name === 'Moon' && r < 25) { /* too close to Earth to label legibly */ }
+    else if (r < 60) { if (!nearSun || p.name === 'Earth') { ctx.fillStyle = p.dwarf ? '#b9c3dd' : '#9fb0d8'; ctx.font = (p.dwarf ? 'italic ' : '') + '12px system-ui'; ctx.fillText(p.name, x + r + 5, y - r - 3); } }
+    else { ctx.fillStyle = '#fff'; ctx.font = '13px system-ui'; ctx.fillText(p.name, x - 18, y + 4); }
+    addHit(x, y, r + 3, p.name === 'Moon' ? 0.4 : 0.1, () => {
+      const rows = bodyRows(p.pos, p.name === 'Earth' ? null : E, 'Earth');
+      if (p.name !== 'Earth') rows.push(['Radius', p.radius_km.toLocaleString() + ' km']);
+      return tipHTML(p.name, p.dwarf ? 'dwarf planet' : (p.name === 'Moon' ? 'moon' : 'planet'), rows,
+        p.dwarf ? (DWARF_NOTE[p.name] || '') + ' Source: ' + p.source : '');
+    });
+  }
+  ringHalf(true);
+
+  // Sun-direction arrow near Earth
+  if (earthXY && earthXY[2] > 20) {
+    const L = 7.2e-5, tip = project([E[0]+state.sun_dir[0]*L, E[1]+state.sun_dir[1]*L, E[2]+state.sun_dir[2]*L], c, s);
+    ctx.strokeStyle = '#ffd35a'; ctx.setLineDash([6, 5]); ctx.lineWidth = 1.2; ctx.beginPath();
+    ctx.moveTo(earthXY[0], earthXY[1]); ctx.lineTo(tip[0], tip[1]); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = '#ffd35a'; ctx.font = '12px system-ui'; ctx.fillText('to Sun', tip[0] + 6, tip[1]);
+  }
+
+  // SPHEREx survey: the two Deep Fields sit at the ecliptic poles, so SPHEREx's line of sight toward them
+  if (opt.cSurvey) {
+    for (const [pole, name, lab] of [[NEP, 'North Ecliptic Pole', 'Deep Field N'], [SEP, 'South Ecliptic Pole', 'Deep Field S']]) {
+      const L = 9, tipP = [sp.pos[0] + pole[0]*L, sp.pos[1] + pole[1]*L, sp.pos[2] + pole[2]*L];
+      const a = project(sp.pos, c, s), b = project(tipP, c, s);
+      const cl = onScr(a[0], a[1]) && onScr(b[0], b[1]) ? [a[0], a[1], b[0], b[1]] : clipSeg(a[0], a[1], b[0], b[1]);
+      if (cl) { ctx.strokeStyle = '#3fd0c0aa'; ctx.lineWidth = 1.2; ctx.setLineDash([2, 5]); ctx.beginPath();
+        ctx.moveTo(cl[0], cl[1]); ctx.lineTo(cl[2], cl[3]); ctx.stroke(); ctx.setLineDash([]); }
+      if (!onScr(b[0], b[1])) continue;
+      ctx.fillStyle = '#3fd0c0'; ctx.beginPath(); ctx.arc(b[0], b[1], 4, 0, 7); ctx.fill();
+      if (wAU < 40) { ctx.font = '12px system-ui'; ctx.fillText(lab + ' (direction)', b[0] + 8, b[1] + 4); }
+      addHit(b[0], b[1], 10, 0.3, () => tipHTML('SPHEREx ' + lab, 'survey region', [
+        [name, 'RA / Dec ' + fmtRADec(pole)], ['Size', '≈ 100 sq. deg. (radius ' + DEEP_RADIUS_DEG.toFixed(1) + '°)']],
+        'A direction, not a place: the field is a patch of sky seen from SPHEREx. It is deepest here because the ecliptic poles are always within SPHEREx\'s view as the Sun moves round.'));
+    }
+  }
+
+  // SPHEREx marker (pulsing; dimmed when Earth is in front of it)
+  const [px, py] = project(sp.pos, c, s);
+  const behind = earthXY && toView(sub(sp.pos, E))[2] < 0 && Math.hypot(px - earthXY[0], py - earthXY[1]) < earthXY[2];
+  ctx.globalAlpha = behind ? 0.35 : 1;
+  const pulse = 9 + 3*Math.sin(performance.now()/350);
+  ctx.strokeStyle = '#ff4d4d'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(px, py, pulse, 0, 7); ctx.stroke();
+  ctx.fillStyle = '#ff4d4d'; ctx.beginPath(); ctx.arc(px, py, 3.5, 0, 7); ctx.fill();
+  if (wAU < 150) { ctx.fillStyle = '#ffd0d0'; ctx.font = 'bold 13px system-ui'; ctx.fillText('SPHEREx', px + 16, py - 10); }
+  ctx.globalAlpha = 1;
+  addHit(px, py, 14, 0.5, () => tipHTML('SPHEREx', 'telescope', [
+    ['Heliocentric r', sp.helio_dist_au.toFixed(5) + ' AU'], ['Ecl. lon / lat', sp.ecl_lon_deg.toFixed(3) + '° / ' + sp.ecl_lat_deg.toFixed(3) + '°'],
+    ['X, Y, Z (AU)', sp.pos.map(v => v.toFixed(5)).join(', ')], ['Altitude', Math.round(sp.altitude_km).toLocaleString() + ' km'],
+    ['Orbit period', sp.period_min.toFixed(1) + ' min'], ['RA / Dec from Earth centre', fmtRADec(norm(sub(sp.pos, E)))]],
+    sp.live ? 'Live position (TLE + SGP4).' : 'Approximate: position along the orbit is not known without a TLE.'));
+
+  setReadout('View width ≈ ' + fmtLen(wAU) + (fade < 0.02 ? '<br>zoom out to reveal constellations' : ''));
+}
+
+// ---------------------------------------------------------------- sky view ---
+function drawSkyView() {
+  drawStarfield(1);
+  const SK = skyScale(), sp = state.spherex, E = state.E;
+  const onScreen = q => q && q[0] > -20 && q[0] < W+20 && q[1] > -20 && q[1] < H+20;
+
+  // SPHEREx survey regions (sky coordinates, so these are exact apart from the band's width)
+  if (opt.cSurvey) {
+    const sunDir = norm(sub([0,0,0], sp.pos));
+    // 1. today's imaging band: SPHEREx observes ~90 deg from the Sun (approximate width +-5 deg)
+    ctx.strokeStyle = '#3fd0c0'; ctx.lineWidth = 1.3; ctx.setLineDash([8, 6]);
+    for (const a of [85, 95]) { ctx.beginPath(); drawGreatPath(smallCircle(sunDir, a, 180), SK); ctx.stroke(); }
+    ctx.setLineDash([]);
+    const mid = smallCircle(sunDir, 90, 72);
+    let bestLabel = null;
+    for (const p of mid) { const q = skyXY(toView(p), SK); if (onScreen(q) && q[0] > 60 && q[0] < W - 160 && q[1] > 70 && q[1] < H - 40) { bestLabel = {q, p}; if (Math.abs(q[0] - W/2) < W*0.25) break; } }
+    if (bestLabel) {
+      ctx.fillStyle = '#3fd0c0'; ctx.font = '12px system-ui'; ctx.fillText('SPHEREx imaging band (~90° from Sun, approx.)', bestLabel.q[0] + 8, bestLabel.q[1] - 8);
+      addHit(bestLabel.q[0], bestLabel.q[1], 14, -0.2, () => tipHTML('SPHEREx imaging band', 'survey region', [
+        ['Centre', 'great circle 90° from the Sun'], ['Passes through', 'both ecliptic poles']],
+        'SPHEREx keeps its boresight roughly perpendicular to the Sun. As the Sun moves along the ecliptic the band sweeps the whole sky every six months. The ±5° width drawn here is approximate.'));
+    }
+    // 2. Deep Fields at the ecliptic poles
+    for (const [pole, name] of [[NEP, 'Deep Field North'], [SEP, 'Deep Field South']]) {
+      const pts = smallCircle(pole, DEEP_RADIUS_DEG, 90);
+      ctx.beginPath(); drawGreatPath(pts, SK); ctx.fillStyle = '#3fd0c022'; ctx.fill();
+      ctx.strokeStyle = '#3fd0c0'; ctx.lineWidth = 1.6; ctx.stroke();
+      const q = skyXY(toView(pole), SK);
+      if (onScreen(q)) {
+        ctx.fillStyle = '#3fd0c0'; ctx.font = 'bold 12px system-ui'; ctx.fillText(name, q[0] + 10, q[1] + 4);
+        addHit(q[0], q[1], 22, 0.3, () => tipHTML('SPHEREx ' + name, 'survey region', [
+          ['Centre', (pole[2] > 0 ? 'North' : 'South') + ' ecliptic pole'], ['RA / Dec (J2000)', fmtRADec(pole)],
+          ['Size', '≈ 100 sq. deg. (radius ' + DEEP_RADIUS_DEG.toFixed(1) + '°)']],
+          'Deepest SPHEREx coverage: the poles stay in view all year, so they are observed far more often than the rest of the sky.'));
+      }
+    }
+  }
+
+  // Sun, Moon, planets, dwarf planets as seen from SPHEREx
+  const bodies = [{name: 'Sun', dir: norm(sub([0,0,0], sp.pos)), col: '#ffd35a', r: 7, kind: 'star', pos: [0,0,0]}];
+  for (const p of state.planets) if (p.name !== 'Earth')
+    bodies.push({name: p.name, dir: norm(sub(p.pos, sp.pos)), col: COLORS[p.name], r: p.name === 'Moon' ? 4.5 : 3.5, kind: p.name === 'Moon' ? 'moon' : 'planet', pos: p.pos});
+  if (opt.cDwarfs) for (const d of (state.dwarfs || []))
+    bodies.push({name: d.name, dir: norm(sub(d.pos, sp.pos)), col: COLORS[d.name], r: 3, kind: 'dwarf planet', pos: d.pos, note: (DWARF_NOTE[d.name] || '') + ' Source: ' + d.source});
+  ctx.font = '12px system-ui';
+  for (const b of bodies) {
+    const q = skyXY(toView(b.dir), SK);
+    if (!onScreen(q)) continue;
+    drawGlow(q[0], q[1], b.name === 'Sun' ? 36 : 14, b.col);
+    ctx.fillStyle = b.col; ctx.beginPath(); ctx.arc(q[0], q[1], b.r, 0, 7); ctx.fill();
+    ctx.fillStyle = '#fff'; ctx.fillText(b.name, q[0] + b.r + 5, q[1] - b.r - 2);
+    addHit(q[0], q[1], b.r + 5, 0.1, () => tipHTML(b.name, b.kind, [
+      ['RA / Dec from SPHEREx', fmtRADec(b.dir)], ['Distance from SPHEREx', distStr(Math.hypot(...sub(b.pos, sp.pos)))],
+      ['Ecl. lon / lat', ((Math.atan2(b.dir[1], b.dir[0])/D2R + 360) % 360).toFixed(2) + '° / ' + (Math.asin(b.dir[2])/D2R).toFixed(2) + '°']], b.note || ''));
+  }
+
+  // Earth: huge disc blocking the sky below SPHEREx
+  const toE = norm(sub(E, sp.pos)), rho = Math.asin(Math.min(1, EARTH_R_KM/sp.earth_dist_km));
+  const p1 = norm(cross(toE, Math.abs(toE[2]) < 0.9 ? [0,0,1] : [1,0,0])), p2 = cross(toE, p1);
+  // The projection is singular at the point opposite the look axis. If Earth covers that point
+  // (e.g. looking straight up), Earth is the *outside* of its limb circle: fill the complement.
+  const coversPole = toView(toE)[2] > Math.cos(rho);
+  ctx.beginPath();
+  if (coversPole) ctx.rect(-1e5, -1e5, 2e5, 2e5);
+  for (let i = 0; i <= 180; i++) {
+    const f = i/180*2*Math.PI;
+    const d = [0,1,2].map(k => Math.cos(rho)*toE[k] + Math.sin(rho)*(Math.cos(f)*p1[k] + Math.sin(f)*p2[k]));
+    const q = skyXY(toView(d), SK, true);
+    i ? ctx.lineTo(q[0], q[1]) : ctx.moveTo(q[0], q[1]);
+  }
+  ctx.closePath();
+  ctx.fillStyle = '#0b2a55'; ctx.fill(coversPole ? 'evenodd' : 'nonzero');
+  ctx.strokeStyle = '#4da3ff'; ctx.lineWidth = 2; ctx.stroke();
+  const qe = skyXY(toView(toE), SK);
+  if (qe && qe[0] > 0 && qe[0] < W && qe[1] > 0 && qe[1] < H) {
+    ctx.fillStyle = '#9cc8ff'; ctx.font = '14px system-ui'; ctx.fillText('Earth', qe[0] - 16, qe[1]);
+    addHit(qe[0], qe[1], 30, -0.5, () => tipHTML('Earth', 'planet', [['Distance from SPHEREx', Math.round(sp.earth_dist_km).toLocaleString() + ' km'],
+      ['Angular radius', (rho/D2R).toFixed(1) + '°'], ['RA / Dec of Earth centre', fmtRADec(toE)]], 'SPHEREx cannot image through Earth, so a large part of the sky below is blocked.'));
+  }
+
+  // crosshair at centre
+  ctx.strokeStyle = '#ffffff55'; ctx.lineWidth = 1; ctx.beginPath();
+  ctx.moveTo(W/2 - 14, H/2); ctx.lineTo(W/2 + 14, H/2); ctx.moveTo(W/2, H/2 - 14); ctx.lineTo(W/2, H/2 + 14); ctx.stroke();
+
+  const [ra, dec] = ecl2eq(fromView([0, 0, -1]));
+  setText('ctr', fmtRA(ra) + ' / ' + fmtDec(dec));
+  if (cursor) {
+    const u = (cursor[0] - W/2)/SK, v = -(cursor[1] - H/2)/SK, r2 = u*u + v*v, k = 2/(1 + r2);
+    const [cra, cdec] = ecl2eq(fromView([u*k, v*k, -(1 - r2)/(1 + r2)]));
+    setText('cur', fmtRA(cra) + ' / ' + fmtDec(cdec));
+  } else setText('cur', '—');
+  setReadout('Field of view ≈ ' + (4*Math.atan(W/(2*SK))/D2R).toFixed(0) + '° wide');
+}
+
+// --------------------------------------------------------------- main loop ---
+let last = performance.now(), ema = 16.7, slowFrames = 0, lastAdapt = 0;
+const perf = {n: 0, ms: 0, max: 0};
+const noAdapt = location.search.includes('noadapt'), showPerf = location.search.includes('perf');
+if (showPerf) $('perf').style.display = 'block';
+function frame(t) {
+  const dtRaw = t - last, dtm = Math.min(0.1, dtRaw/1000); last = t;
+  const t0 = performance.now();
+
+  // eased zoom: wheel/slider set a goal and the view glides toward it
+  if (!anim) {
+    const d = ztGoal - zt;
+    if (Math.abs(d) > 1e-5) { zt += d*(1 - Math.exp(-dtm*14)); if (Math.abs(zt - +$('zoom').value) > 2e-4) $('zoom').value = zt; }
+    const lf = Math.log(skyGoal) - Math.log(skyFov);
+    if (Math.abs(lf) > 1e-4) skyFov = Math.exp(Math.log(skyFov) + lf*(1 - Math.exp(-dtm*14)));
+  }
+  ctx.clearRect(0, 0, W, H); hits = [];
+  if (spin && !dragging) rotateBy(0.25*dtm, 0, 0);
+  if (state) { (mode === 'sky' ? drawSkyView : draw3D)(); pickHit(); }
+
+  const ms = performance.now() - t0; perf.n++; perf.ms += ms; perf.max = Math.max(perf.max, ms);
+  // adaptive resolution: if frames stay slow, lower the canvas resolution until it is smooth
+  if (dtRaw < 250) ema += (dtRaw - ema)*0.08;
+  slowFrames = ema > 34 ? slowFrames + 1 : 0;
+  if (!noAdapt && slowFrames > 60 && K > 0.61 && t - lastAdapt > 1200) { resScale *= 0.8; applyRes(); lastAdapt = t; slowFrames = 0; }
+  if (showPerf && perf.n % 20 === 0) $('perf').textContent = `${(1000/ema).toFixed(0)} fps · draw ${(perf.ms/perf.n).toFixed(1)} ms (max ${perf.max.toFixed(0)}) · canvas x${K.toFixed(2)}`;
+  if (perf.n % 120 === 0) { perf.ms = 0; perf.max = 0; perf.n = 1; }
+  requestAnimationFrame(frame);
+}
+
+// -------------------------------------------------------------------- data ---
+async function poll() {
+  try {
+    const st = await (await fetch('/api/state')).json();
+    // precompute everything the draw loop would otherwise rebuild every frame
+    st.byName = {}; st.bodies = [];
+    for (const p of st.planets) { st.byName[p.name] = p; st.bodies.push({...p, dwarf: false}); }
+    for (const d of (st.dwarfs || [])) st.bodies.push({...d, dwarf: true});
+    st.E = st.byName.Earth.pos;
+    st.ringAbs = st.spherex.ring.map(o => [st.E[0]+o[0], st.E[1]+o[1], st.E[2]+o[2]]);
+    st.moonAbs = st.moon_ring ? st.moon_ring.map(o => [st.E[0]+o[0], st.E[1]+o[1], st.E[2]+o[2]]) : null;
+    state = st;
+    const sp = st.spherex, f = (v, d = 4) => v.toFixed(d);
+    setText('utc', st.utc); setText('rsun', f(sp.helio_dist_au) + ' AU');
+    setText('lonlat', f(sp.ecl_lon_deg, 2) + '° / ' + f(sp.ecl_lat_deg, 2) + '°');
+    setText('xyz', sp.pos.map(v => f(v)).join(', '));
+    setText('alt', Math.round(sp.altitude_km).toLocaleString() + ' km');
+    setText('per', f(sp.period_min, 1) + ' min'); setText('src', sp.source); setText('eph', st.ephemeris);
+    $('src').style.color = sp.live ? '' : '#ffb347';
+  } catch (e) { console.warn(e); }
+}
+const radiiCache = new WeakMap();
+function orbitRadii(set) {                              // farthest point of each orbit (for on-screen size checks)
+  if (!set) return {};
+  if (!radiiCache.has(set)) { const r = {}; for (const k in set) r[k] = maxR(set[k]); radiiCache.set(set, r); }
+  return radiiCache.get(set);
+}
+async function loadDwarfOrbits() {                    // paths arrive once the server has them from JPL Horizons
+  try {
+    const d = await (await fetch('/api/dwarf_orbits')).json();
+    dwarfOrbits = d.paths;
+    if (!d.complete) setTimeout(loadDwarfOrbits, 4000);
+  } catch (e) { setTimeout(loadDwarfOrbits, 4000); }
+}
+
+// ------------------------------------------------------------- interaction ---
+let saved3d = null;
+const NOTE3D = 'Drag to rotate freely · Shift-drag or Q/E to roll · wheel/slider to zoom · hover for coordinates. Frame: heliocentric ecliptic J2000.';
+const zenith = () => lookAt(norm(sub(state.spherex.pos, state.E)), [0,0,1]);
+function setMode(m) {
+  if (m === mode || !state) return;
+  if (m === 'sky') {
+    saved3d = R.map(r => r.slice());
+    R = zenith();                                      // start looking at zenith
+    skyFov = skyGoal = 1; document.body.classList.add('sky');
+    $('mode').textContent = '3D solar system'; $('mode').classList.remove('primary');
+    $('note').textContent = 'Sky as seen from SPHEREx. Drag to look around, wheel to zoom, Shift-drag or Q/E to roll. Hover for coordinates. Frame: ecliptic J2000.';
+  } else {
+    if (saved3d) R = saved3d;
+    document.body.classList.remove('sky');
+    $('mode').textContent = 'Sky from SPHEREx'; $('mode').classList.add('primary');
+    $('note').textContent = NOTE3D;
+  }
+  mode = m;
+}
+function animateTo(target, ms) {
+  const from = zt, t0 = performance.now();
+  anim = t => { const k = Math.min(1, (t - t0)/ms), e = k < .5 ? 2*k*k : 1 - Math.pow(-2*k + 2, 2)/2;
+    zt = ztGoal = from + (target - from)*e; $('zoom').value = zt; return k >= 1; };
+  (function step(t) { if (anim && !anim(t)) requestAnimationFrame(step); else anim = null; })(performance.now());
+}
+const setView = M => { if (mode === '3d') R = M; };
+$('mode').onclick = () => setMode(mode === '3d' ? 'sky' : '3d');
+$('reset').onclick = () => { if (mode === '3d') R = matFromYawPitch(-0.5, 1.0); else { R = zenith(); skyFov = skyGoal = 1; } };
+$('top').onclick = () => setView(matFromYawPitch(0, Math.PI/2));
+$('edge').onclick = () => setView(matFromYawPitch(0, 0.0));
+$('spin').onclick = () => { spin = !spin; $('spin').classList.toggle('on', spin); };
+$('zoom').oninput = () => { anim = null; ztGoal = +$('zoom').value; };
+$('in').onclick = () => animateTo(1, 7000);
+$('out').onclick = () => animateTo(tFit(), 5000);
+$('far').onclick = () => animateTo(0, 5000);
+
+function zoomBy(delta) {
+  if (mode === 'sky') skyGoal = clamp(skyGoal*Math.exp(delta), 0.35, 40);
+  else { anim = null; ztGoal = clamp(ztGoal + delta*0.6, 0, 1); }
+}
+cv.addEventListener('wheel', e => { e.preventDefault(); zoomBy(-e.deltaY*0.001); }, {passive: false});
+
+const pointers = new Map(); let prevPinch = null;
+cv.onpointerdown = e => { pointers.set(e.pointerId, [e.clientX, e.clientY]); cv.setPointerCapture(e.pointerId);
+  dragging = true; cv.classList.add('drag'); prevPinch = null; };
+cv.onpointerup = cv.onpointercancel = e => { pointers.delete(e.pointerId); prevPinch = null;
+  if (!pointers.size) { dragging = false; cv.classList.remove('drag'); } };
+cv.onpointermove = e => {
+  cursor = [e.clientX, e.clientY];
+  const p = pointers.get(e.pointerId); if (!p) return;
+  if (pointers.size === 1) {
+    const dx = (e.clientX - p[0])*0.005, dy = (e.clientY - p[1])*0.005;
+    if (e.shiftKey || e.buttons & 2) rotateBy(0, 0, dx); else rotateBy(dx, dy, 0);
+  } else if (pointers.size === 2) {                    // pinch to zoom, twist to roll
+    pointers.set(e.pointerId, [e.clientX, e.clientY]);
+    const [a, b] = [...pointers.values()], d = Math.hypot(a[0]-b[0], a[1]-b[1]), ang = Math.atan2(b[1]-a[1], b[0]-a[0]);
+    if (prevPinch) { zoomBy(Math.log(d/prevPinch.d)*(mode === 'sky' ? 1 : 0.5)); rotateBy(0, 0, ang - prevPinch.ang); }
+    prevPinch = {d, ang}; return;
+  }
+  pointers.set(e.pointerId, [e.clientX, e.clientY]);
+};
+cv.onpointerleave = () => { cursor = null; };
+cv.oncontextmenu = e => e.preventDefault();
+addEventListener('keydown', e => {
+  const step = 0.06;
+  if (e.key === 'q' || e.key === 'Q') rotateBy(0, 0, -step);
+  else if (e.key === 'e' || e.key === 'E') rotateBy(0, 0, step);
+  else if (e.key === 'ArrowLeft') rotateBy(-step, 0, 0); else if (e.key === 'ArrowRight') rotateBy(step, 0, 0);
+  else if (e.key === 'ArrowUp') rotateBy(0, -step, 0); else if (e.key === 'ArrowDown') rotateBy(0, step, 0);
+});
+addEventListener('resize', resize);
+
+resize();
+$('note').textContent = NOTE3D;
+fetch('/api/orbits').then(r => r.json()).then(o => orbits = o);
+zt = ztGoal = tFit(); $('zoom').value = zt;
+loadDwarfOrbits(); loadSky(); poll(); setInterval(poll, 1000); requestAnimationFrame(frame);
+</script>
+</body>
+</html>
