@@ -22,6 +22,7 @@ packaging==26.3
 pillow==13.0.0
 pyerfa==2.0.1.5
 pyparsing==3.3.3
+photoutils==2.6.1
 python-dateutil==4.0.0
 pyvo==1.10.0
 pywin32-ctypes==0.2.3
