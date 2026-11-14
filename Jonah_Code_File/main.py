@@ -67,6 +67,10 @@ def run_asteroid(asteroid=cfg.ASTEROID, window=cfg.ASTEROID_WINDOW, max_images=c
     results = {'tracked': tracked, 'frames': frames, 'zooms': zooms, 'movement': movement}
     if cfg.SAVE_RESULTS:
         save_results(results, {'mode': 'asteroid', 'asteroid': asteroid, 'window': window, 'max_images': max_images})
+
+    analyzer = SpectrumAnalyzer(frames)
+    results = {'tracked': tracked, 'frames': frames, 'zooms': zooms, 'movement': movement, 'analyzer': analyzer}
+    
     if show:
         show_viewer(zooms, tracked, movement)
         show_motion(frames, tracked, movement)
@@ -98,6 +102,9 @@ def run_star(ra_deg=cfg.RA_DEG, dec_deg=cfg.DEC_DEG, max_images=cfg.MAX_IMAGES, 
                'brightness': brightness, 'spectrum': spectrum}
     if cfg.SAVE_RESULTS:
         save_results(results, {'mode': 'star', 'ra_deg': ra_deg, 'dec_deg': dec_deg, 'max_images': max_images})
+    analyzer = SpectrumAnalyzer(frames, brightness=brightness, spectrum=spectrum)
+    results = {'tracked': tracked, 'frames': frames, 'zooms': zooms, 'movement': movement, 'brightness': brightness, 'spectrum': spectrum, 'analyzer': analyzer}
+    
     if show:
         show_viewer(zooms, tracked, movement, brightness)
         show_time_series(frames, tracked, movement, brightness)
