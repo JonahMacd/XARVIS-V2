@@ -15,7 +15,7 @@ from .moving import add_predicted_positions, find_asteroid, find_images
 from .plots import show_motion, show_spectrum, show_time_series, show_viewer
 from .results import save_results
 from .target import find_tracked_object
-
+from .spectrumanalyser import SpectrumAnalyzer
 
 def make_zooms(frames, zoom_only):
     """Original-pixel zoom of every frame, in order. zoom_only=True releases each frame's full-size pixel
