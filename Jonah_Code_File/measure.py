@@ -27,12 +27,15 @@ def robust_scatter(values):
 # Bad pixels
 # ----------------------------------------------------------------------------
 
-def bad_pixel_mask(image, flags, flags_header):
+def bad_pixel_mask(image, flags, flags_header, moving=False):
     """True where a pixel can't be trusted: flagged bad by SPHEREx, not a number, or a lone spike that the
-    pipeline missed (one pixel far brighter than all 8 of its neighbors - real sources span several pixels)."""
+    pipeline missed (one pixel far brighter than all 8 of its neighbors - real sources span several pixels).
+    moving=True: the object is moving, so the pipeline's OUTLIER / TRANSIENT flags (which it puts on a moving
+    source) are not counted as bad."""
+    bad_names = cfg.BAD_FLAG_NAMES_MOVING if moving else cfg.BAD_FLAG_NAMES
     bad_bits = 0
     for key in flags_header['MSKN*']:
-        if flags_header[key] in cfg.BAD_FLAG_NAMES:
+        if flags_header[key] in bad_names:
             bad_bits |= 1 << int(key[4:])
     bad = ((flags & bad_bits) != 0) | ~np.isfinite(image)
 
@@ -180,8 +183,51 @@ def track_object(frames):
           f'({offset[largest] / cfg.PIXEL_ARCSEC:.2f} px) in T{largest + 1}. '
           + (f'FLAGGED: {", ".join(f"T{i + 1}" for i in np.flatnonzero(flagged))}' if flagged.any()
              else f'No significant movement (nothing above {cfg.MOVEMENT_SIGMA}x its detector\'s scatter)'))
-    return {'t1': t1, 'd_ra_arcsec': d_ra, 'd_dec_arcsec': d_dec, 'offset_arcsec': offset,
+    return {'reference': t1, 'reference_label': 'object at T1',     # the blue circle in the plots
+            'd_ra_arcsec': d_ra, 'd_dec_arcsec': d_dec, 'offset_arcsec': offset,
             'error_arcsec': error, 'scatter_arcsec': scatter, 'flagged': flagged}
+
+
+def track_moving(frames):
+    """A MOVING object (an asteroid): how far it has travelled since it was first detected, and how well it
+    was found where the ephemeris said it would be.
+
+    A frame counts as detected above DETECTION_SNR. 'residual' = distance between where the object was found
+    and where JPL Horizons predicted it; it is flagged ('OFF EPHEMERIS') above RESIDUAL_LIMIT_PX - usually a
+    star or glitch pulled the position, not a real deviation. Frames are in time order."""
+    snr = np.array([f['snr'] for f in frames])
+    detected = np.isfinite(snr) & (snr >= cfg.DETECTION_SNR)
+    if not detected.any():
+        raise RuntimeError(f'The asteroid is not detected (signal-to-noise {cfg.DETECTION_SNR}) in any of the '
+                           f'{len(frames)} frames - it may be too faint for SPHEREx at this distance')
+    expected = SkyCoord([f['expected_ra'] for f in frames], [f['expected_dec'] for f in frames], unit='deg')
+    found = SkyCoord([f['object_ra'] for f in frames], [f['object_dec'] for f in frames], unit='deg')
+
+    east, north = expected.spherical_offsets_to(found)
+    residual = np.hypot(east.to_value(u.arcsec), north.to_value(u.arcsec))
+    start = found[np.flatnonzero(detected)[0]]                      # first detection
+    d_ra, d_dec = (a.to_value(u.arcsec) for a in start.spherical_offsets_to(found))
+    offset = start.separation(found).arcsec
+    flagged = detected & (residual > cfg.RESIDUAL_LIMIT_PX * cfg.PIXEL_ARCSEC)
+
+    days = np.array([f['mjd'] for f in frames]) - frames[0]['mjd']
+    steps = found[detected][1:].separation(found[detected][:-1]).arcsec
+    span = np.ptp(days[detected])
+    print(f'Asteroid detected in {int(detected.sum())} of {len(frames)} frames (signal-to-noise >= {cfg.DETECTION_SNR}). '
+          f'Found within {np.median(residual[detected]):.1f}" (median) / {np.max(residual[detected]):.1f}" (worst) of its '
+          f'ephemeris position ({np.median(residual[detected]) / cfg.PIXEL_ARCSEC:.2f} / '
+          f'{np.max(residual[detected]) / cfg.PIXEL_ARCSEC:.2f} px).')
+    print(f'It travelled {steps.sum() / 3600:.1f} degrees across the sky in {span:.1f} days '
+          f'(average {steps.sum() / 3600 / max(span, 1e-9):.2f} deg/day).'
+          + (f' Off ephemeris: {", ".join(f"T{i + 1}" for i in np.flatnonzero(flagged)[:12])}'
+             f'{"..." if flagged.sum() > 12 else ""}' if flagged.any() else ''))
+
+    notes = [f'SNR {snr[i]:.0f}   {residual[i]:.1f}" from ephemeris' if detected[i]
+             else f'NOT DETECTED (SNR {snr[i]:.1f})' for i in range(len(frames))]
+    return {'reference': expected, 'reference_label': 'predicted position (JPL Horizons)',
+            'flag_label': 'OFF EPHEMERIS', 'notes': notes, 'detected': detected,
+            'd_ra_arcsec': d_ra, 'd_dec_arcsec': d_dec, 'offset_arcsec': offset, 'residual_arcsec': residual,
+            'error_arcsec': np.array([f['object_err_arcsec'] for f in frames]), 'flagged': flagged}
 
 
 # ----------------------------------------------------------------------------

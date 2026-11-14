@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 
 from astropy import units as u
+from astropy.coordinates import SkyCoord
 from astropy.wcs import WCS
 
 from . import config as cfg
@@ -19,8 +20,9 @@ from .irsa import fetch_cutout
 from .measure import bad_pixel_mask, locate_object, measure_flux
 
 
-def make_frame(hdulist, coord, row):
-    """One frame as a plain dict: the cutout image plus everything later steps need."""
+def make_frame(hdulist, coord, row, moving=False):
+    """One frame as a plain dict: the cutout image plus everything later steps need.
+    moving=True: the object is moving (see bad_pixel_mask)."""
     header = hdulist['IMAGE'].header
     wcs = WCS(header)       # SPHEREx's pointing for this image
 
@@ -42,7 +44,7 @@ def make_frame(hdulist, coord, row):
         'image': image,
         'variance': hdulist['VARIANCE'].data.astype(float),
         'flags': flags,
-        'bad': bad_pixel_mask(image, flags, hdulist['FLAGS'].header),          # ignored in all measurements
+        'bad': bad_pixel_mask(image, flags, hdulist['FLAGS'].header, moving),  # ignored in all measurements
         'wcs': wcs,
         'catalog_xy': (float(x), float(y)),                # the object's catalog position in this cutout
         'mjd': float(header['MJD-AVG']),
@@ -55,16 +57,25 @@ def make_frame(hdulist, coord, row):
     }
 
 
-def load_frame(row, coord):
-    """Download one image's cutout and measure the object in it (runs in parallel, one per image)."""
-    frame = make_frame(fetch_cutout(str(row['access_url']), coord, cfg.CUTOUT_SIZE), coord, row)
+def load_frame(row, coord=None):
+    """Download one image's cutout and measure the object in it (runs in parallel, one per image).
+
+    coord = the object's sky position. None for a MOVING object (an asteroid): its predicted position at this
+    exposure is in the row ('target_ra' / 'target_dec', from the ephemeris), and the cutout is centered there."""
+    moving = coord is None
+    if moving:
+        coord = SkyCoord(float(row['target_ra']), float(row['target_dec']), unit='deg')
+    frame = make_frame(fetch_cutout(str(row['access_url']), coord, cfg.CUTOUT_SIZE), coord, row, moving)
+    frame['expected_ra'], frame['expected_dec'] = float(coord.ra.deg), float(coord.dec.deg)   # where it should be
     frame['flux_mjy'], frame['flux_err_mjy'], frame['n_bad_in_aperture'] = measure_flux(frame, coord)
+    frame['snr'] = frame['flux_mjy'] / frame['flux_err_mjy'] if frame['flux_err_mjy'] > 0 else np.nan
     frame.update(locate_object(frame))
     return frame
 
 
 def load_all_frames(coord, images, max_images=cfg.MAX_IMAGES):
-    """Download and measure every image (or the first `max_images` in time), in parallel. Sorted by time."""
+    """Download and measure every image (or the first `max_images` in time), in parallel. Sorted by time.
+    coord = the star's sky position, or None for a moving object (see load_frame)."""
     rows = list(images if max_images is None else images[:max_images])
     frames, failures = [], []
     start = time.time()

@@ -71,7 +71,7 @@ def with_retries(label, func, *args, quiet=False, **kwargs):
                 message = str(e).splitlines()[0] if str(e) else type(e).__name__
                 print(f'{label}: attempt {attempt + 1}/{cfg.MAX_ATTEMPTS} failed: {message[:120]}')
             time.sleep(retry_wait(attempt))
-    raise RuntimeError(f'{label}: all {cfg.MAX_ATTEMPTS} attempts to reach IRSA failed.')
+    raise RuntimeError(f'{label}: all {cfg.MAX_ATTEMPTS} attempts failed.')
 
 
 def query_images(coord):
@@ -80,6 +80,25 @@ def query_images(coord):
                            pos=(coord, 1 * u.arcsec), collection=cfg.COLLECTIONS)
     results.sort('t_min')
     return results
+
+
+def query_images_at(ra_deg, dec_deg, radius=0.02):
+    """Every SPHEREx image whose footprint covers a sky position, at ANY time (astropy Table).
+
+    One plain request - much lighter than astroquery's, which makes several. IRSA's own time filter is
+    unreliable (it times out), so the caller filters by time (t_min / t_max, MJD)."""
+    params = {'POS': f'CIRCLE {ra_deg} {dec_deg} {radius}', 'COLLECTION': cfg.COLLECTIONS, 'MAXREC': 5000}
+
+    def once():
+        response = _session().get(cfg.SIA_URL, params=params)
+        if response.status_code != 200:
+            raise BadResponse(f'HTTP {response.status_code}')
+        try:
+            return Table.read(io.BytesIO(response.content), format='votable', use_names_over_ids=True)
+        except Exception as e:                      # an error page instead of a table
+            raise BadResponse(f'unreadable reply: {e}')
+
+    return with_retries('SPHEREx image search', once, quiet=True)
 
 
 CATALOG_COLUMNS = {'fp_psc': 'designation,ra,dec,j_m,j_msigcom,h_m,h_msigcom,k_m,k_msigcom',
@@ -116,8 +135,10 @@ def fetch_cutout(image_url, coord, size):
     def once():
         with _download_slots:                       # at most MAX_CONCURRENT_DOWNLOADS at a time, program-wide
             response = _session().get(image_url, params=params)
-        if response.status_code != 200:
-            raise BadResponse(f'HTTP {response.status_code}')
+        if response.status_code in (429, 500, 502, 503, 504):
+            raise BadResponse(f'HTTP {response.status_code}')       # IRSA is struggling: try again
+        if response.status_code != 200:                             # a real refusal: retrying can't help
+            raise ValueError(f'IRSA refused the cutout (HTTP {response.status_code})')
         return response.content
 
     content = with_retries('Cutout', once, quiet=True)

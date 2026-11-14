@@ -1,13 +1,14 @@
-"""SPHEREx transient analysis: every SPHEREx image of a real star, T1 ... Tn in time order.
+"""SPHEREx transient analysis: every SPHEREx image of a moving asteroid (or a star), T1 ... Tn in time order.
 
 Modules
-  config.py   all settings
+  config.py   all settings (which asteroid or star, time window, ...)
   irsa.py     talking to IRSA: timeouts, retries, image search, catalogs, cutouts
-  target.py   pick the star to track and its catalog brightness
+  moving.py   an asteroid: its path from JPL Horizons, and the SPHEREx images that caught it
+  target.py   a star: pick the one to track and its catalog brightness
   frames.py   download + measure every image (placed by SPHEREx's pointing only); original-pixel zooms
-  measure.py  brightness, position, alignment check, movement, brightness changes, spectrum check
-  plots.py    frame viewer (slider), frame grid, time series, spectrum
-  main.py     runs everything (python -m Jonah_Code_File, or run Test_Jonah_code.py)
+  measure.py  brightness, position, movement, brightness changes, alignment and spectrum checks
+  plots.py    frame viewer (slider), frame grid, asteroid motion, star time series, spectrum
+  main.py     runs everything (run __main__.py, or python -m Jonah_Code_File)
 """
 
 import warnings

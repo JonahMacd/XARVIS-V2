@@ -2,7 +2,17 @@
 
 from astropy import units as u
 
-## target: snapped to the nearest bright, isolated 2MASS star (see target.py)
+## WHAT TO TRACK. An asteroid (moves a lot - the transient case), or a star (stays put).
+# JPL Horizons id of the asteroid: a number ('433' = Eros) or a name. Set to None to track the star below instead.
+ASTEROID = '433'
+# Time window to search, as dates (SPHEREx data runs 2025-04-29 to about 2026-06-14). SPHEREx always looks ~90 degrees
+# away from the Sun, so an asteroid is only in its images while it is near that solar elongation (82-98 degrees).
+ASTEROID_WINDOW = ('2026-02-15', '2026-06-15')      # Eros: ~125 images over 4 months, crossing ~100 degrees of sky
+GRID_SPACING_DEG = 1.5              # image search: one position search every this many degrees along the path
+DETECTION_SNR = 5                   # the asteroid counts as detected in a frame above this signal-to-noise
+RESIDUAL_LIMIT_PX = 1.5             # flag a detection this far (pixels) from where the ephemeris says it should be
+
+## the star (used when ASTEROID is None): snapped to the nearest bright, isolated 2MASS star (see target.py)
 RA_DEG = 304.693508808
 DEC_DEG = 42.4436872991
 
@@ -34,6 +44,10 @@ SPECTRUM_MIN_NEIGHBORS = 4          # ...and at least this many, otherwise the f
 BAD_FLAG_NAMES = {'TRANSIENT', 'OVERFLOW', 'SUR_ERROR', 'NONFUNC', 'MISSING_DATA', 'HOT', 'COLD', 'NONLINEAR',
                   'PERSIST', 'OUTLIER', 'CROSSTALK', 'GHOST', 'GHOST_FPA', 'GHOST_EXT', 'STREAK', 'BLOOM',
                   'SNOWBALL'}
+# For a MOVING object these two are not defects: SPHEREx's own pipeline marks a moving source's brightest pixels
+# as OUTLIER / TRANSIENT, because it changes during the exposure the way a cosmic-ray hit does. (Measured on Eros:
+# 103 of its pixels in 16 of 28 frames were flagged OUTLIER.) Throwing them away throws away the asteroid itself.
+BAD_FLAG_NAMES_MOVING = BAD_FLAG_NAMES - {'OUTLIER', 'TRANSIENT'}
 # Spikes the pipeline missed (e.g. an unflagged hot pixel): a real source always spreads over several
 # pixels, so a single pixel this many times brighter than ALL its neighbors, and far above the noise, isn't one.
 # Measured: real star centers reach ~7x their brightest neighbor; the hot pixels found were 48x and 95x.
@@ -49,5 +63,6 @@ REQUEST_TIMEOUT = 30                # seconds to wait for IRSA to start answerin
 MAX_CONCURRENT_DOWNLOADS = 16       # parallel cutout downloads (measured: 16 is fastest; 24 makes IRSA refuse more)
 COLLECTIONS = ['spherex_dr1', 'spherex_qr3']
 GATOR_URL = 'https://irsa.ipac.caltech.edu/cgi-bin/Gator/nph-query'
+SIA_URL = 'https://irsa.ipac.caltech.edu/SIA'
 
 PIXEL_ARCSEC = 6.15                 # SPHEREx pixel size
