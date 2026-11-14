@@ -53,6 +53,14 @@ class BadResponse(Exception):
 RETRY_ERRORS = (DALAccessError, requests.RequestException, OSError, BadResponse)
 
 
+def retry_wait(attempt):
+    """WAIT_SECONDS for the first FAST_ATTEMPTS retries; after that, back off (doubling, up to
+    MAX_WAIT_SECONDS) so a longer IRSA outage can't use up all attempts within a few seconds."""
+    if attempt < cfg.FAST_ATTEMPTS:
+        return cfg.WAIT_SECONDS
+    return min(0.1 * 2 ** (attempt - cfg.FAST_ATTEMPTS), cfg.MAX_WAIT_SECONDS)
+
+
 def with_retries(label, func, *args, quiet=False, **kwargs):
     """Call func(*args, **kwargs), retrying on IRSA errors up to MAX_ATTEMPTS times."""
     for attempt in range(cfg.MAX_ATTEMPTS):
@@ -62,7 +70,7 @@ def with_retries(label, func, *args, quiet=False, **kwargs):
             if not quiet:
                 message = str(e).splitlines()[0] if str(e) else type(e).__name__
                 print(f'{label}: attempt {attempt + 1}/{cfg.MAX_ATTEMPTS} failed: {message[:120]}')
-            time.sleep(cfg.WAIT_SECONDS)
+            time.sleep(retry_wait(attempt))
     raise RuntimeError(f'{label}: all {cfg.MAX_ATTEMPTS} attempts to reach IRSA failed.')
 
 

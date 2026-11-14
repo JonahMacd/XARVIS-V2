@@ -1,46 +1,49 @@
 """Run the whole analysis: python -m Jonah_Code_File   (or run Test_Jonah_code.py)."""
 
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 import matplotlib.pyplot as plt
 from astropy.coordinates import SkyCoord
 
 from . import config as cfg
-from .frames import pointing_report, select_frames, zoom_original
+from .frames import load_all_frames, pointing_summary, zoom_original
 from .irsa import query_images
-from .measure import check_alignment, measure_flux, spectrum_check, track_object
-from .plots import show_frames, show_movement, show_spectrum
+from .measure import brightness_changes, check_alignment, spectrum_check, track_object
+from .plots import show_spectrum, show_time_series, show_viewer
 from .target import find_tracked_object
 
 
-def run(ra_deg=cfg.RA_DEG, dec_deg=cfg.DEC_DEG, show=True):
+def run(ra_deg=cfg.RA_DEG, dec_deg=cfg.DEC_DEG, max_images=cfg.MAX_IMAGES, show=True, zoom_only=False):
+    """Run the whole analysis. Returns a dict with 'tracked', 'frames', 'zooms', 'movement', 'brightness',
+    'spectrum'.
+
+    zoom_only=True: after the analysis, keep only the zoomed pixels in memory - each frame's full-size
+    cutout arrays are released as its zoom is cut (results['frames'] then hold measurements only, and
+    results['zooms'] hold the pixels). The default keeps both."""
     start = time.time()
-    tracked = find_tracked_object(SkyCoord(ra_deg, dec_deg, unit='deg'))      # step 0: a real star to track
+    tracked = find_tracked_object(SkyCoord(ra_deg, dec_deg, unit='deg'))      # a real star to track
     coord = tracked['coord']
     images = query_images(coord)
     print(f"{len(images)} SPHEREx images cover {tracked['name']}")
 
-    with ThreadPoolExecutor(max_workers=1) as background:
-        spectrum = background.submit(spectrum_check, tracked, images)          # runs while frames download
+    frames = load_all_frames(coord, images, max_images)       # one download per image; measured on arrival
+    pointing_summary(frames)
+    check_alignment(frames, tracked['field_stars'])            # verifies the pointing, never adjusts it
+    movement = track_object(frames)                            # position vs T1
+    brightness = brightness_changes(frames)                    # brightness vs the object's own spectrum
+    spectrum = spectrum_check(tracked, frames)                 # is it the catalog star?
 
-        frames = select_frames(coord, images)                                 # step 1: T1 ... Tn
-        zooms = [zoom_original(frame, coord) for frame in frames]             # step 2: original-pixel zooms
-        pointing_report(frames)
-        alignment_floor = check_alignment(zooms, tracked['field_stars'])
-        movement = track_object(zooms, coord, alignment_floor)
-        for i, zoom in enumerate(zooms):
-            flux, flux_err = measure_flux(zoom, coord)
-            print(f"  T{i + 1:<2} flux {flux:7.2f} +/- {flux_err:.2f} mJy at {zoom['wavelength_um']:.3f} um")
-
-        check = spectrum.result()                                             # step 3: same object?
+    zooms = []                                                 # original-pixel zoom of every frame, in order
+    for frame in frames:
+        zooms.append(zoom_original(frame, release_original=zoom_only))
     print(f'Done in {time.time() - start:.0f} s')
 
-    results = {'tracked': tracked, 'zooms': zooms, 'movement': movement, 'spectrum': check}
+    results = {'tracked': tracked, 'frames': frames, 'zooms': zooms, 'movement': movement,
+               'brightness': brightness, 'spectrum': spectrum}
     if show:
-        show_frames(zooms, tracked, movement)
-        show_movement(movement, tracked)
-        show_spectrum(check, tracked)
+        show_viewer(zooms, tracked, movement, brightness)
+        show_time_series(frames, tracked, movement, brightness)
+        show_spectrum(spectrum, tracked)
         plt.show()
     return results
 

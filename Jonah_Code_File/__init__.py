@@ -1,12 +1,12 @@
-"""SPHEREx transient analysis: the same patch of sky at T1 ... Tn, centered on a real star.
+"""SPHEREx transient analysis: every SPHEREx image of a real star, T1 ... Tn in time order.
 
 Modules
   config.py   all settings
   irsa.py     talking to IRSA: timeouts, retries, image search, catalogs, cutouts
-  target.py   step 0 - pick the star to track and its catalog brightness
-  frames.py   steps 1-2 - pick T1 ... Tn and zoom on the original pixels (placed by SPHEREx's pointing only)
-  measure.py  brightness, position, alignment check, movement tracking, spectrum check
-  plots.py    figures
+  target.py   pick the star to track and its catalog brightness
+  frames.py   download + measure every image (placed by SPHEREx's pointing only); original-pixel zooms
+  measure.py  brightness, position, alignment check, movement, brightness changes, spectrum check
+  plots.py    frame viewer (slider), frame grid, time series, spectrum
   main.py     runs everything (python -m Jonah_Code_File, or run Test_Jonah_code.py)
 """
 
