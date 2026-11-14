@@ -1,22 +1,39 @@
+"""XARVIS test script: query IRSA for SPHEREx spectral images and inspect one.
+
+Based on the IRSA "Introduction to SPHEREx Spectral Images" tutorial, with:
+  - retry loops so a temporary IRSA outage (502 etc.) doesn't kill the script
+  - the missing fits.open step restored (hdulist)
+  - Firefly viewer made optional
+
+Install:  pip install numpy matplotlib astropy astroquery firefly-client requests
+"""
 import http.client
 import time
 import urllib.error
 
 import numpy as np
 import matplotlib.pyplot as plt
+import requests
 
 from astropy.io import fits
 from astropy.wcs import WCS
-from astropy.table import Table
 from astropy import units as u
 from astropy.coordinates import SkyCoord
 from astropy.utils.data import conf
 
 from astroquery.ipac.irsa import Irsa
 from pyvo.dal.exceptions import DALServiceError
-import requests
 
-from firefly_client import FireflyClient
+try:
+    from firefly_client import FireflyClient
+except ImportError:
+    FireflyClient = None
+
+# ----------------------------------------------------------------- settings ---
+USE_FIREFLY = True        # set False to skip the interactive viewer
+RETRY_INTERVAL = 1.0      # seconds between attempts. Please don't go much lower:
+                          # IRSA is a shared public archive.
+GIVE_UP_AFTER = None      # seconds before giving up, or None to retry forever
 
 # Reading SPHEREx files can exceed astropy's default timeout.
 conf.remote_timeout = 120
@@ -37,18 +54,15 @@ RETRYABLE = (
 )
 
 
-def query_with_retry(interval=0.1, give_up_after=None):
-    """Retry the IRSA SIA query every `interval` seconds until it succeeds."""
+def retry(label, func, interval=RETRY_INTERVAL, give_up_after=GIVE_UP_AFTER):
+    """Call func() until it succeeds, pausing `interval` s between attempts."""
     start = time.time()
     attempt = 0
     while True:
         attempt += 1
         try:
-            print(f"[attempt {attempt}] querying IRSA SIA...")
-            return Irsa.query_sia(
-                pos=(coord, search_radius),
-                collection=["spherex_dr1", "spherex_qr3"],
-            )
+            print(f"[{label}] attempt {attempt}...")
+            return func()
         except RETRYABLE as e:
             elapsed = time.time() - start
             print(f"  failed after {elapsed:.0f}s: {str(e)[:100]!r}")
@@ -56,71 +70,79 @@ def query_with_retry(interval=0.1, give_up_after=None):
                 raise
             time.sleep(interval)
 
-results = query_with_retry()
-print(f"Got {len(results)} spectral images")
 
-spectral_image_url = results['access_url'][0]
+# -------------------------------------------------- 1. find spectral images ---
+results = retry(
+    "IRSA SIA query",
+    lambda: Irsa.query_sia(pos=(coord, search_radius), collection=["spherex_dr1", "spherex_qr3"]),
+)
+print(f"Got {len(results)} spectral images")
+print(results.colnames)
+
+spectral_image_url = results["access_url"][0]
 print(spectral_image_url)
 
-fc = FireflyClient.make_client(url="https://irsa.ipac.caltech.edu/irsaviewer")
 
-fc.reinit_viewer()
+# ----------------------------------------------- 2. download the FITS file ---
+def load_fits():
+    # memmap=False + touching every .data reads all extensions into memory,
+    # so hdulist stays usable after the file is closed.
+    with fits.open(spectral_image_url, memmap=False) as hdul:
+        for hdu in hdul:
+            hdu.data
+        return hdul
 
-fc.show_fits_image(file_input=spectral_image_url,
-             plot_id="spectral_image",
-             Title="Spectral Image"
-             )
 
+hdulist = retry("FITS download", load_fits)
+hdulist.info()
+
+# ------------------------------------------ 3. optional Firefly visualization ---
+if USE_FIREFLY and FireflyClient is not None:
+    try:
+        fc = FireflyClient.make_client(url="https://irsa.ipac.caltech.edu/irsaviewer")
+        fc.reinit_viewer()  # prints a link: open it in your browser
+        fc.show_fits_image(file_input=spectral_image_url, plot_id="spectral_image", Title="Spectral Image")
+    except Exception as e:  # viewer is a nice-to-have; don't stop the script
+        print(f"Firefly skipped: {e}")
+elif USE_FIREFLY:
+    print("firefly-client not installed (pip install firefly-client); skipping viewer.")
+
+# ----------------------------------------------------- 4. header + spatial WCS ---
 spectral_image_header = hdulist[1].header
 
-keywords_to_print = ['EXTNAME', 'NAXIS1', 'NAXIS2', 'BUNIT', 'DETECTOR', 'OBSID', 'DATE', 'PSF_FWHM']
+for keyword in ["EXTNAME", "NAXIS1", "NAXIS2", "BUNIT", "DETECTOR", "OBSID", "DATE", "PSF_FWHM"]:
+    print(f"{keyword}: {spectral_image_header.get(keyword, 'Keyword not found')}")
 
-for keyword in keywords_to_print:
-    value = spectral_image_header.get(keyword, 'Keyword not found')
-    print(f"{keyword}: {value}")
-
-spectral_image_header['WCSNAME*']
+print(spectral_image_header["WCSNAME*"])
 
 wcs = WCS(spectral_image_header)
-wcs
+print(wcs)
 
 ra, dec = wcs.wcs.crval
 x, y = wcs.world_to_pixel(SkyCoord(ra=ra, dec=dec, unit="deg"))
 print(ra, dec, x, y)
 
-# Load the Spectral WCS from the header.
-# Note that we need to provide a reference to HDU List, which contains a lookup table.
+# ------------------------------------------------------------ 5. spectral WCS ---
+# The wavelength lookup table lives in the WCS-WAVE extension, so pass the HDU list.
 spectral_wcs = WCS(header=hdulist["IMAGE"].header, fobj=hdulist, key="W")
+spectral_wcs.sip = None  # SIP distortion must be off for the spectral WCS
 
-# SIP distortions must be turned off for the spectral WCS.
-spectral_wcs.sip = None
-
-# The standard Astropy methods for converting pixel coordinates to world coordinates can also be used to obtain spectral coordinates.
-# Take the pixel coordinates that we determined for the image center and resolve them to the wavelength and bandwidth for that pixel
 wl, bw = spectral_wcs.pixel_to_world(x, y)
-wl, bw
+print("Wavelength / bandwidth at image centre:", wl, bw)
 
-# Read in the spectral image data.
 spectral_image = hdulist["IMAGE"]
 spectral_image_data = spectral_image.data
 
-# Get arrays of pixel coordinates for the image.
-(y, x) = np.indices(spectral_image.shape)
+(yy, xx) = np.indices(spectral_image.shape)
+wavelength, bandwidth = spectral_wcs.pixel_to_world(xx, yy)
+print("Wavelength:\n", wavelength)
+print("Bandwidth:\n", bandwidth)
 
-# Use the spectral WCS to convert these pixel coordinates to spectral coordinates.
-spectral_coords = spectral_wcs.pixel_to_world(x, y)
-
-# Break out the two spectral coordinates (wavelength and bandwidth) from the spectral coordinates, and print the results.
-wavelength, bandwidth = spectral_coords
-print("Wavelength: \n", wavelength)
-print("Bandwidth: \n", bandwidth)
-
-# Plot the wavelength as a greyscale color map across the image pixels.
-plt.imshow(wavelength.value, origin='lower', cmap='gray')
+# ----------------------------------------------------------------- 6. plot ---
+plt.imshow(wavelength.value, origin="lower", cmap="gray")
 plt.colorbar(label=f"Wavelength [{wavelength.unit}]")
-
-detector = hdulist["IMAGE"].header["DETECTOR"]
-plt.title(f"Wavelength - Detector {detector}")
+plt.title(f"Wavelength - Detector {hdulist['IMAGE'].header['DETECTOR']}")
 plt.show()
 
-spectral_image_header['L2 N_*']
+# Pixel-flag counts written by the processing pipeline
+print(spectral_image_header["L2 N_*"])
