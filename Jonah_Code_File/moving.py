@@ -47,8 +47,9 @@ def fetch_ephemeris(asteroid, epochs, location='500'):
     """JPL Horizons observer table (astropy Table) for `asteroid` as seen from `location`
     ('500' = Earth's center). `epochs` = dict(start, stop, step) or a list of Julian dates (UT)."""
     def once():
+        # cache=False: astroquery's own cache is never cleaned up (it had grown to 23 MB); these queries take ~1 s
         return Horizons(id=asteroid, id_type='smallbody', location=location, epochs=epochs).ephemerides(
-            quantities='1,3,9,19,20,23,24')         # position, rates, brightness, distances, elongation, phase
+            quantities='1,3,9,19,20,23,24', cache=False)   # position, rates, brightness, distances, elongation, phase
 
     return with_retries(f'Horizons {asteroid}', once)
 

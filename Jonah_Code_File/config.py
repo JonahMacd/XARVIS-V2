@@ -23,6 +23,17 @@ ISOLATION_MAX_FRACTION = 0.15       # ...and together must be under 15% of the s
 
 ## dataset
 MAX_IMAGES = None                   # None = every SPHEREx image of the object; e.g. 40 for a quick test
+ZOOM_ONLY = True                    # after the analysis keep only the zoomed pixels in memory (frees the rest)
+
+## disk cache: makes re-runs fast (no re-downloading), and cleans itself up after every run (see cache.py)
+CACHE_ENABLED = True                # False = never write anything to disk
+CACHE_DIR = None                    # None = a local folder OneDrive doesn't sync (%LOCALAPPDATA%\Jonah_Code_File\cache)
+CACHE_MAX_AGE_DAYS = 7              # files not used for this long are deleted...
+CACHE_MAX_MB = 500                  # ...and the least recently used ones above this size (~95 KB per image)
+
+## results: the measurements of every frame, saved as a small table (one file per target, replaced each run)
+SAVE_RESULTS = True
+RESULTS_DIR = None                  # None = a 'results' folder next to Jonah_Code_File
 ZOOM_SIZE_PIX = 50                  # zoom: 50 x 50 ORIGINAL pixels centered on the object
 CUTOUT_SIZE = 5.5 * u.arcmin        # downloaded cutout: ~54 x 54 pixels, a little bigger than the zoom
 

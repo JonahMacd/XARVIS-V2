@@ -18,6 +18,7 @@ from astropy.table import Table
 from astroquery.ipac.irsa import Irsa
 from pyvo.dal.exceptions import DALAccessError     # base of all pyvo errors: 502s, timeouts, bad replies
 
+from . import cache
 from . import config as cfg
 
 
@@ -86,17 +87,28 @@ def query_images_at(ra_deg, dec_deg, radius=0.02):
     """Every SPHEREx image whose footprint covers a sky position, at ANY time (astropy Table).
 
     One plain request - much lighter than astroquery's, which makes several. IRSA's own time filter is
-    unreliable (it times out), so the caller filters by time (t_min / t_max, MJD)."""
-    params = {'POS': f'CIRCLE {ra_deg} {dec_deg} {radius}', 'COLLECTION': cfg.COLLECTIONS, 'MAXREC': 5000}
+    unreliable (it times out), so the caller filters by time (t_min / t_max, MJD). Replies are cached on disk
+    (see cache.py) - a new SPHEREx data release can therefore take up to CACHE_MAX_AGE_DAYS to show up."""
+    params = {'POS': f'CIRCLE {ra_deg:.6f} {dec_deg:.6f} {radius}', 'COLLECTION': cfg.COLLECTIONS, 'MAXREC': 5000}
+    key = cache.make_key(cfg.SIA_URL, params['POS'], *cfg.COLLECTIONS)
+
+    def read(content):
+        return Table.read(io.BytesIO(content), format='votable', use_names_over_ids=True)
+
+    cached = cache.get('searches', key)
+    if cached is not None:
+        return read(cached)
 
     def once():
         response = _session().get(cfg.SIA_URL, params=params)
         if response.status_code != 200:
             raise BadResponse(f'HTTP {response.status_code}')
         try:
-            return Table.read(io.BytesIO(response.content), format='votable', use_names_over_ids=True)
+            table = read(response.content)
         except Exception as e:                      # an error page instead of a table
             raise BadResponse(f'unreadable reply: {e}')
+        cache.put('searches', key, response.content)
+        return table
 
     return with_retries('SPHEREx image search', once, quiet=True)
 
@@ -129,8 +141,14 @@ def query_catalog(coord, catalog, radius):
 
 def fetch_cutout(image_url, coord, size):
     """Small cutout (HDUList) of one SPHEREx image around `coord`, cut server-side by IRSA.
-    Kept in memory only: nothing is written to disk."""
-    params = {'center': f'{coord.ra.deg},{coord.dec.deg}', 'size': f'{size.to_value(u.arcsec)}arcsec'}
+
+    IRSA sends ~4 MB per cutout, mostly a PSF table we don't use; only the extensions we use are kept, and
+    those (~95 KB) are cached on disk so a re-run doesn't download them again (see cache.py)."""
+    params = {'center': f'{coord.ra.deg:.6f},{coord.dec.deg:.6f}', 'size': f'{size.to_value(u.arcsec)}arcsec'}
+    key = cache.make_key(image_url, params['center'], params['size'])
+    cached = cache.get('cutouts', key)
+    if cached is not None:
+        return fits.open(io.BytesIO(cached), memmap=False)
 
     def once():
         with _download_slots:                       # at most MAX_CONCURRENT_DOWNLOADS at a time, program-wide
@@ -149,4 +167,8 @@ def fetch_cutout(image_url, coord, size):
             if isinstance(hdu, fits.CompImageHDU):          # FLAGS is compressed; keep it as a plain image
                 hdu = fits.ImageHDU(data=hdu.data, header=hdu.header, name=name)
             hdulist.append(hdu.copy())
+    if cfg.CACHE_ENABLED:
+        trimmed = io.BytesIO()
+        hdulist.writeto(trimmed)
+        cache.put('cutouts', key, trimmed.getvalue())
     return hdulist
