@@ -1,6 +1,7 @@
 """Run the whole analysis: run __main__.py, or python -m Jonah_Code_File (settings: config.json; or the command
 line - python -m Jonah_Code_File --help)."""
 
+import logging
 import argparse
 import time
 
@@ -12,7 +13,7 @@ from astropy.coordinates import SkyCoord
 from . import cache
 from . import config as cfg
 from .frames import load_all_frames, pointing_summary, zoom_original
-from .irsa import query_catalog, query_images, query_images_at
+from .irsa import query_catalog, query_images_at
 from .measure import (brightness_changes, check_alignment, compare_with_catalog, detection_summary,
                       reliable_frames, spectrum_check, track_moving, track_object)
 from .moving import add_predicted_positions, find_asteroid, find_images
@@ -20,10 +21,8 @@ from .plots import LiveView, show_motion, show_spectrum, show_time_series, show_
 from .results import save_results
 from .stars import catalog_sed, contamination_check, position_at, positions_at, resolve_star
 from .target import find_tracked_object
-<<<<<<< HEAD
-=======
 
->>>>>>> c1d8aa66f425c25a7bebed24e1ed90e62e8a42ab
+log = logging.getLogger(__name__)
 
 MID_DATA_MJD = 61000.0          # ~2025-11, middle of the SPHEREx data so far: where to search for a moving star
 
@@ -35,7 +34,6 @@ def start_live_view(tracked, images, show):
         return None
     return LiveView(tracked, len(images), float(min(images['t_min'])))
 
-from .spectrumanalyser import SpectrumAnalyzer
 
 def make_zooms(frames, zoom_only):
     """Original-pixel zoom of every frame, in order. zoom_only=True releases each frame's full-size pixel
@@ -110,30 +108,33 @@ def run_coords(coords=cfg.COORDS, max_images=cfg.MAX_IMAGES, show=True, zoom_onl
                 if not np.ma.is_masked(mag):
                     magnitudes[band] = (float(mag), 0.05 if np.ma.is_masked(err) else float(err))
     except RuntimeError as e:
-        print(f'  (2MASS not available: {e})')
+        log.info(f'  (2MASS not available: {e})')
     star = {'name': name, 'object_type': 'sky position', 'query': str(coords), 'ra': coord.ra.deg,
             'dec': coord.dec.deg, 'pmra': 0.0, 'pmdec': 0.0, 'parallax': None, 'rv': None,
             'magnitudes': magnitudes, 'spectral_type': '?'}
-    print(f'Pointing at {name} ({coord.ra.deg:.5f}, {coord.dec.deg:+.5f} deg) - fixed on the sky'
+    log.info(f'Pointing at {name} ({coord.ra.deg:.5f}, {coord.dec.deg:+.5f} deg) - fixed on the sky'
           + (f"; 2MASS source there: K = {magnitudes['K'][0]:.2f}" if 'K' in magnitudes else '; no 2MASS source within 3"'))
     return run_fixed_target(star, {'mode': 'coordinates', 'coords': str(coords)}, max_images, show, zoom_only)
 
 
-def field_check(frames, coord):
+def field_check(frames, coord, unknowns=True):
     """Every frame's sources vs Gaia DR3 / CatWISE, unexplained sources looked up at JPL (see field.py).
     Needs the full pixels (before make_zooms). Returns (field table, summary) - (None, None) if the catalogs
-    can't be reached (never stops the run)."""
+    can't be reached (never stops the run). unknowns=False: only the pointing check against Gaia - when the sky
+    map runs too, it finds and identifies the unknown sources itself (with ONE JPL call), so this doesn't."""
     if not cfg.FIELD_CHECK:
         return None, None
     from .field import describe_target, field_summary, identify_candidates, query_field
     try:
         field = query_field(coord)
         describe_target(field, coord, frames[0]['mjd'])
-        summary = field_summary(frames, field, target=[(f['expected_ra'], f['expected_dec']) for f in frames])
-        identify_candidates(summary['candidates'])
+        summary = field_summary(frames, field, target=[(f['expected_ra'], f['expected_dec']) for f in frames],
+                                unknowns=unknowns)
+        if unknowns:
+            identify_candidates(summary['candidates'])
         return field, summary
     except RuntimeError as e:
-        print(f'Field comparison with Gaia / CatWISE skipped: {e}')
+        log.info(f'Field comparison with Gaia / CatWISE skipped: {e}')
         return None, None
 
 
@@ -144,7 +145,7 @@ def sky_map(frames, coord):
     try:
         return map_sky(frames, coord)
     except RuntimeError as e:
-        print(f'Sky map skipped: {e}')
+        log.info(f'Sky map skipped: {e}')
         return None
 
 
@@ -163,7 +164,7 @@ def run_fixed_target(star, settings, max_images=cfg.MAX_IMAGES, show=True, zoom_
             images = images[:max_images]
         t_mid = 0.5 * (np.array(images['t_min'], dtype=float) + np.array(images['t_max'], dtype=float))
         images['target_ra'], images['target_dec'] = positions_at(star, t_mid)          # where it was each time
-        print(f"{len(images)} SPHEREx images cover {star['name']}")
+        log.info(f"{len(images)} SPHEREx images cover {star['name']}")
         zoom_corner = cfg.ZOOM_SIZE_PIX / 2 * cfg.PIXEL_ARCSEC * np.sqrt(2) * u.arcsec
         tracked = {'name': star['name'], 'coord': now, 'star': star, 'catalog_sed': catalog_sed(star),
                    'field_stars': query_catalog(now, 'fp_psc', zoom_corner)}       # for the alignment check
@@ -179,9 +180,10 @@ def run_fixed_target(star, settings, max_images=cfg.MAX_IMAGES, show=True, zoom_
         pointing_summary(frames)
         check_alignment(frames, tracked['field_stars'])        # verifies the pointing, never adjusts it
         detection = detection_summary(frames)                  # (needs the full pixels: before make_zooms)
-        tracked['field'], field = field_check(frames, now)     # vs Gaia / CatWISE / JPL (needs the full pixels)
+        use_sky_map = settings.get('mode') == 'coordinates' or cfg.SKYMAP_FOR_ALL_TARGETS
+        tracked['field'], field = field_check(frames, now, unknowns=not use_sky_map)   # vs Gaia / CatWISE / JPL
         sky = None
-        if settings.get('mode') == 'coordinates' or cfg.SKYMAP_FOR_ALL_TARGETS:
+        if use_sky_map:
             sky = tracked['skymap'] = sky_map(frames, now)      # name every object, find the new ones
         movement = track_object(frames)                        # SPHEREx alone: position vs T1
         catalog_motion = compare_with_catalog(frames, movement, star)     # vs SIMBAD/Gaia proper motion
@@ -194,14 +196,14 @@ def run_fixed_target(star, settings, max_images=cfg.MAX_IMAGES, show=True, zoom_
         measured = np.sum(reliable_frames(frames) & np.isfinite(snr) & (snr >= cfg.DETECTION_SNR))
         spectrum = spectrum_check(tracked, frames) if measured >= 10 and len(tracked['catalog_sed']) >= 3 else None
         if spectrum is None and (measured < 10 or len(tracked['catalog_sed']) < 3):
-            print(f'Spectrum check: skipped - only {measured} frames with a measured brightness (saturated or too faint), '
+            log.info(f'Spectrum check: skipped - only {measured} frames with a measured brightness (saturated or too faint), '
                   f'or too few catalog points')
         zooms = make_zooms(frames, zoom_only)
     finally:
         if live:
             live.close()
         cache.prune()                                          # clean up the disk cache, even if the run failed
-    print(f'Done in {time.time() - start:.0f} s')
+    log.info(f'Done in {time.time() - start:.0f} s')
 
     results = {'tracked': tracked, 'frames': frames, 'zooms': zooms, 'movement': movement, 'brightness': brightness,
                'spectrum': spectrum, 'detection': detection, 'catalog_motion': catalog_motion,
@@ -235,7 +237,7 @@ def run_path(name, mjd, ra, dec, max_images=cfg.MAX_IMAGES, show=True, zoom_only
     dec_t = np.interp(t, np.asarray(mjd)[order], np.asarray(dec)[order])
     tracked = {'name': name, 'asteroid': None, 'ephemeris': Ephemeris.from_arrays(t, ra_t, dec_t),
                'window': (min(mjd), max(mjd))}
-    print(f'Tracking {name} along its fitted path, MJD {min(mjd):.2f} - {max(mjd):.2f}')
+    log.info(f'Tracking {name} along its fitted path, MJD {min(mjd):.2f} - {max(mjd):.2f}')
     return run_moving(tracked, {'mode': 'path', 'name': name, 'mjd': list(mjd), 'ra': list(ra), 'dec': list(dec)},
                       max_images, show, zoom_only, spacing_deg=0.05)
 
@@ -265,7 +267,7 @@ def run_moving(tracked, settings, max_images=cfg.MAX_IMAGES, show=True, zoom_onl
         if live:
             live.close()
         cache.prune()                                          # clean up the disk cache, even if the run failed
-    print(f'Done in {time.time() - start:.0f} s')
+    log.info(f'Done in {time.time() - start:.0f} s')
 
     results = {'tracked': tracked, 'frames': frames, 'zooms': zooms, 'movement': movement}
     if cfg.SAVE_RESULTS:
@@ -278,46 +280,13 @@ def run_moving(tracked, settings, max_images=cfg.MAX_IMAGES, show=True, zoom_onl
 
 
 def run_star(ra_deg=cfg.RA_DEG, dec_deg=cfg.DEC_DEG, max_images=cfg.MAX_IMAGES, show=True, zoom_only=cfg.ZOOM_ONLY):
-    """A star: stays put on the sky, so its brightness and position are compared with its own history."""
-    start = time.time()
-    live = None
-    try:
-        tracked = find_tracked_object(SkyCoord(ra_deg, dec_deg, unit='deg'))      # a real star to track
-        coord = tracked['coord']
-        images = query_images(coord)
-        print(f"{len(images)} SPHEREx images cover {tracked['name']}")
-        if max_images:
-            images = images[:max_images]
-
-        live = start_live_view(tracked, images, show)          # shows frames as they come in
-        frames = load_all_frames(coord, images, on_frame=live.update if live else None)   # measured on arrival
-        if live:
-            live.close()                                       # all frames are in: the full analysis follows
-            live = None
-        pointing_summary(frames)
-        check_alignment(frames, tracked['field_stars'])        # verifies the pointing, never adjusts it
-        tracked['field'], field = field_check(frames, coord)   # vs Gaia / CatWISE / JPL (needs the full pixels)
-        movement = track_object(frames)                        # position vs T1
-        brightness = brightness_changes(frames)                # brightness vs the object's own spectrum
-        spectrum = spectrum_check(tracked, frames)             # is it the catalog star?
-        zooms = make_zooms(frames, zoom_only)
-    finally:
-        if live:
-            live.close()
-        cache.prune()                                          # clean up the disk cache, even if the run failed
-    print(f'Done in {time.time() - start:.0f} s')
-
-    results = {'tracked': tracked, 'frames': frames, 'zooms': zooms, 'movement': movement,
-               'brightness': brightness, 'spectrum': spectrum, 'field': field}
-    if cfg.SAVE_RESULTS:
-        save_results(results, {'mode': 'star', 'ra_deg': ra_deg, 'dec_deg': dec_deg, 'max_images': max_images})
-    if show:
-        show_viewer(zooms, tracked, movement, brightness)
-        show_time_series(frames, tracked, movement, brightness)
-        if spectrum:
-            show_spectrum(spectrum, tracked)
-        plt.show()
-    return results
+    """The nearest bright, isolated 2MASS star to (ra_deg, dec_deg) (see target.find_tracked_object), analysed like
+    any star: it stays put on the sky, so its brightness and position are compared with its own history."""
+    snapped = find_tracked_object(SkyCoord(ra_deg, dec_deg, unit='deg'))
+    star = {'name': snapped['name'], 'object_type': '2MASS star', 'query': f'{ra_deg} {dec_deg}',
+            'ra': snapped['coord'].ra.deg, 'dec': snapped['coord'].dec.deg, 'pmra': 0.0, 'pmdec': 0.0,
+            'parallax': None, 'rv': None, 'magnitudes': snapped['magnitudes'], 'spectral_type': '?'}
+    return run_fixed_target(star, {'mode': 'star', 'ra_deg': ra_deg, 'dec_deg': dec_deg}, max_images, show, zoom_only)
 
 
 def run_catalog_star(star, max_images=cfg.MAX_IMAGES, show=True, zoom_only=cfg.ZOOM_ONLY):
@@ -336,7 +305,7 @@ def run_track(spec, max_images=cfg.MAX_IMAGES, show=True, zoom_only=cfg.ZOOM_ONL
         return run_coords(tuple(spec['coords']), max_images, show, zoom_only)
     if kind == 'path':
         return run_path(spec['name'], spec['mjd'], spec['ra'], spec['dec'], max_images, show, zoom_only)
-    print(f"Can't track {spec.get('name', 'this object')}: {spec.get('reason', 'not supported')}")
+    log.info(f"Can't track {spec.get('name', 'this object')}: {spec.get('reason', 'not supported')}")
     return None
 
 
@@ -376,7 +345,7 @@ def interactive(max_images=None):
                 run_track(spec, max_images)
                 spec = take_track_request()
         except Exception as e:                              # back to the start window, not a crash
-            print(f'\nThat run stopped: {type(e).__name__}: {e}\n')
+            log.info(f'\nThat run stopped: {type(e).__name__}: {e}\n')
 
 
 def cli(argv=None):

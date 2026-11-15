@@ -1,5 +1,6 @@
 """Fit apparent SPHEREx motion; run ``python -m Jonah_Code_File.algorithm`` to process sibling results/."""
 
+import logging
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,11 @@ from matplotlib.patches import Ellipse
 from scipy.interpolate import PchipInterpolator
 
 from . import config as cfg
+from .measure import usable_frames
+
+log = logging.getLogger(__name__)
+
+_NO_SNR_LIMIT = 1e12        # stands in for "signal-to-noise not measured" (a finite number usable_frames accepts)
 
 
 def _observations(frames: Sequence[Mapping[str, Any]]) -> tuple[np.ndarray, np.ndarray, np.ndarray, SkyCoord]:
@@ -23,8 +29,13 @@ def _observations(frames: Sequence[Mapping[str, Any]]) -> tuple[np.ndarray, np.n
     times = np.asarray([float(frame["mjd"]) for frame in frames], dtype=float)
     ra = np.asarray([float(frame["object_ra"]) for frame in frames], dtype=float)
     dec = np.asarray([float(frame["object_dec"]) for frame in frames], dtype=float)
-    reliable = np.asarray([frame.get("object_found", True) and frame.get("n_bad_in_aperture", 0) == 0
-                           for frame in frames], dtype=bool)
+    # Same rule as the rest of the pipeline (measure.usable_frames): detected, on track and no bad pixel in the
+    # circle (or a saturated star's glow fit). Frames where the object was NOT found keep its expected position
+    # for display - fitting those would mix catalog/ephemeris positions into the measured motion.
+    found = np.asarray([frame.get("object_found", True) for frame in frames], dtype=bool)
+    # (frames without these measurements - e.g. synthetic ones - aren't excluded by them)
+    reliable = found & usable_frames([dict(frame, n_bad_in_aperture=frame.get("n_bad_in_aperture", 0),
+                                           snr=frame.get("snr", _NO_SNR_LIMIT)) for frame in frames])
     valid = reliable & np.isfinite(times) & np.isfinite(ra) & np.isfinite(dec)
     indices = np.flatnonzero(valid)
     if not len(indices):
@@ -199,6 +210,119 @@ def orbital_prediction(
     }
 
 
+STAR_MODES = ("named star", "catalog star", "star", "coordinates")
+VISIT_SYSTEMATIC_ARCSEC = 0.15     # per-visit systematic position offset (measured on eps Indi B: ~0.1-0.2")
+
+
+def parallax_factors(ra_deg: float, dec_deg: float, mjd: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """East / north apparent shift (arcsec) of a star at (ra, dec) per arcsecond of parallax, at times `mjd`
+    (Earth's barycentric position; the same model as stars.positions_at)."""
+    from astropy.coordinates import get_body_barycentric
+    from astropy.time import Time
+    earth = get_body_barycentric("earth", Time(np.asarray(mjd, dtype=float), format="mjd"))
+    x, y, z = (earth.x.to_value(u.au), earth.y.to_value(u.au), earth.z.to_value(u.au))
+    a, d = np.radians(ra_deg), np.radians(dec_deg)
+    east = x * np.sin(a) - y * np.cos(a)
+    north = x * np.cos(a) * np.sin(d) + y * np.sin(a) * np.sin(d) - z * np.cos(d)
+    return east, north
+
+
+def star_motion_fit(frames: Sequence[Mapping[str, Any]], prediction_days: float = 0.0,
+                    parallax_mas: float | None = None) -> dict[str, Any]:
+    """Fit a STAR's measured positions with the physical model for stars: a straight line on the sky (proper
+    motion) plus the yearly parallax wobble from Earth's orbit - five numbers: position (2), proper motion (2),
+    parallax. A quadratic can't follow the wobble (Barnard's Star: +/-0.55"), so for stars this replaces
+    orbital_prediction. Needs >= 3 survey visits over >= 180 days.
+
+    parallax_mas: the catalog parallax, if known - then it is held fixed and only position and proper motion are
+    fitted. Use it when you can: SPHEREx sees a patch of sky from opposite sides of its orbit, turned around, so
+    its per-visit offsets follow the same yearly rhythm as the parallax wobble, and with 3-4 visits SPHEREx alone
+    can't tell them apart (measured: free fits gave R Dra, ~4 mas, a parallax of 448 +/- 131 mas). A free fit's
+    parallax is returned with parallax_reliable=False.
+
+    Returns proper motion (mas/yr, RA*cos(Dec) and Dec) and parallax (mas) with 1-sigma errors (scaled up by the
+    fit's reduced chi-square when that is > 1), residuals, and the sampled model path."""
+    from .measure import robust_scatter, survey_visits
+    times, all_positions, indices, origin = _observations(frames)
+    t = times[indices]
+    positions = all_positions[indices]
+    if np.ptp(t) < 180:
+        raise ValueError("a proper-motion + parallax fit needs observations spanning at least 180 days")
+    sigma = _position_uncertainties(frames, indices)
+    p_east, p_north = parallax_factors(origin.ra.deg, origin.dec.deg, t)
+
+    # Fit per survey VISIT, not per frame: frames of one visit share a small systematic offset (SPHEREx turns
+    # between visits; measured on eps Indi B: ~0.1-0.2" - see measure.compare_with_catalog), so hundreds of
+    # frames are NOT hundreds of independent measurements - per frame, the parallax came out at 1.8x the catalog
+    # value with a 20x too small error. Each visit: weighted mean position, time and parallax factor, with an
+    # error that includes VISIT_SYSTEMATIC_ARCSEC.
+    visit = survey_visits(t)
+    n_visits = int(visit.max()) + 1
+    if n_visits < 3:
+        raise ValueError("a proper-motion + parallax fit needs at least 3 survey visits")
+    rows = []
+    for v in range(n_visits):
+        m = visit == v
+        w = 1 / sigma[m] ** 2
+        mean = lambda a: float(np.sum(w * a) / np.sum(w))
+        scatter = max(robust_scatter(positions[m, 0]), robust_scatter(positions[m, 1])) / np.sqrt(m.sum())
+        error = float(np.hypot(max(1 / np.sqrt(np.sum(w)), np.nan_to_num(scatter)), VISIT_SYSTEMATIC_ARCSEC))
+        rows.append((mean(t[m]), mean(positions[m, 0]), mean(positions[m, 1]), mean(p_east[m]), mean(p_north[m]), error))
+    vt, ve, vn, vpe, vpn, verr = (np.array(c) for c in zip(*rows))
+    t_ref = float(np.average(vt, weights=1 / verr ** 2))
+    years = (vt - t_ref) / 365.25
+    n = n_visits
+    fixed = parallax_mas is not None and np.isfinite(parallax_mas)
+    n_params = 4 if fixed else 5
+    design = np.zeros((2 * n, n_params))
+    design[:n, 0], design[n:, 1] = 1.0, 1.0
+    design[:n, 2], design[n:, 3] = years, years
+    values = np.r_[ve, vn]
+    if fixed:       # the catalog parallax's wobble is removed first; only position + proper motion are fitted
+        values = values - float(parallax_mas) / 1000 * np.r_[vpe, vpn]
+    else:
+        design[:n, 4], design[n:, 4] = vpe, vpn
+    weights = 1 / np.r_[verr, verr]
+    params, *_ = np.linalg.lstsq(design * weights[:, None], values * weights, rcond=None)
+    dof = 2 * n - n_params
+    chi2 = float(np.sum(((values - design @ params) * weights) ** 2) / dof) if dof > 0 else np.nan
+    covariance = np.linalg.inv((design * weights[:, None]).T @ (design * weights[:, None])) * max(np.nan_to_num(chi2), 1.0)
+    errors = np.sqrt(np.diag(covariance))
+    if fixed:
+        params, errors = np.r_[params, float(parallax_mas) / 1000], np.r_[errors, 0.0]
+    all_years = (t - t_ref) / 365.25
+    model_east = params[0] + params[2] * all_years + params[4] * p_east
+    model_north = params[1] + params[3] * all_years + params[4] * p_north
+    residuals = np.r_[positions[:, 0] - model_east, positions[:, 1] - model_north]
+
+    path_t = np.linspace(t.min(), t.max() + prediction_days, max(200, 4 * len(t)))
+    pe, pn = parallax_factors(origin.ra.deg, origin.dec.deg, path_t)
+    path_years = (path_t - t_ref) / 365.25
+    path_east = params[0] + params[2] * path_years + params[4] * pe
+    path_north = params[1] + params[3] * path_years + params[4] * pn
+    path = origin.spherical_offsets_by(path_east * u.arcsec, path_north * u.arcsec)
+    return {
+        "reference_coord": origin,
+        "observation_times_mjd": t,
+        "observed_positions_arcsec": positions,
+        "proper_motion_mas_per_yr": params[2:4] * 1000,
+        "proper_motion_err_mas_per_yr": errors[2:4] * 1000,
+        "parallax_mas": float(params[4] * 1000),
+        "parallax_err_mas": float(errors[4] * 1000),
+        "parallax_fixed": bool(fixed),
+        "parallax_reliable": bool(fixed),   # (a free SPHEREx-only parallax is not - see above)
+        "reduced_chi2": chi2,
+        "n_visits": n_visits,
+        "residuals_arcsec": np.c_[residuals[:len(t)], residuals[len(t):]],
+        "predicted_times_mjd": path_t,
+        "predicted_positions_arcsec": np.c_[path_east, path_north],
+        "predicted_ra_deg": path.ra.deg,
+        "predicted_dec_deg": path.dec.deg,
+        "model": "proper_motion_parallax",
+        "prediction_days": prediction_days,
+    }
+
+
 def _column(table: Table, name: str, default: Any, dtype: Any) -> np.ndarray:
     """Read an ECSV column, filling masked cells or absent columns with a default."""
     if name not in table.colnames:
@@ -221,11 +345,13 @@ def _frames_from_table(table: Table, source: Path) -> list[dict[str, Any]]:
     errors = _column(table, "object_err_arcsec", np.nan, float)
     alignment = _column(table, "alignment_px", np.nan, float)
     detected = _column(table, "detected", True, bool)
+    snr = _column(table, "snr", _NO_SNR_LIMIT, float)   # (older files without an snr column: nothing excluded)
     astrometry_ok = _column(table, "astrometry_ok", True, bool)
 
     if "track" in table.colnames:
-        track = np.char.lower(np.asarray(table["track"]).astype(str))
-        track_ok = ~np.isin(track, ("off", "undetected", "none", "false", "nan"))
+        # only 'ok' is a trusted position ('off', 'undetected' and 'no astrometry' are not - see measure.locate_object)
+        track = np.char.lower(np.char.strip(np.asarray(table["track"]).astype(str)))
+        track_ok = track == "ok"
     else:
         track_ok = np.ones(len(table), dtype=bool)
     if "position_method" in table.colnames:
@@ -247,6 +373,8 @@ def _frames_from_table(table: Table, source: Path) -> list[dict[str, Any]]:
                                   else int(bad_pixels[i])),
             "object_err_arcsec": float(errors[i]),
             "alignment_px": float(alignment[i]),
+            "snr": float(snr[i]),
+            "position_method": "wings" if method_is_wings else "centroid",
         })
     return frames
 
@@ -346,8 +474,18 @@ def run_from_results(
             times, positions, indices, origin = _observations(frames)
             max_offset_arcsec = float(np.max(np.hypot(positions[indices, 0], positions[indices, 1])))
             use_spherical_path = mode == "asteroid" or max_offset_arcsec > 3600.0
+            star_fit = None
+            if mode in STAR_MODES and not use_spherical_path:
+                try:                                # stars: proper motion + parallax (the physical model)
+                    catalog_parallax = table.meta.get("catalog_parallax_mas")
+                    star_fit = star_motion_fit(frames, prediction_days,
+                                               float(catalog_parallax) if catalog_parallax not in (None, "None") else None)
+                except ValueError:                  # too short a span: the apparent-track fit below
+                    star_fit = None
             if use_spherical_path:
                 estimate = _spherical_interpolated_path(frames, prediction_days)
+            elif star_fit is not None:
+                estimate = star_fit
             else:
                 estimate = orbital_prediction(frames, prediction_days=prediction_days,
                                               show_plot=False, make_plot=False)
@@ -377,7 +515,7 @@ def run_from_results(
             }
         except ValueError as exc:
             skipped[source.name] = str(exc)
-            print(f"Skipping {source.name}: {exc}")
+            log.info(f"Skipping {source.name}: {exc}")
 
     output_path = None
     if estimates:
@@ -408,10 +546,10 @@ def run_from_results(
         output.write(output_path, format="ascii.ecsv", overwrite=True)
 
     candidates = [name for name, estimate in estimates.items() if estimate["is_moving_candidate"]]
-    print(f"Estimated {len(estimates)} apparent paths from {len(files)} result files; "
+    log.info(f"Estimated {len(estimates)} apparent paths from {len(files)} result files; "
           f"{len(candidates)} moving candidate(s).")
     if output_path is not None:
-        print(f"Estimated paths saved to {output_path}")
+        log.info(f"Estimated paths saved to {output_path}")
     return {
         "results_dir": directory,
         "estimates": estimates,

@@ -5,17 +5,20 @@ Nearby stars move: Barnard's Star by 10.4" a year, so its 2MASS position (taken 
 where SPHEREx sees it. Every SPHEREx frame is therefore cut around the star's position AT THAT FRAME'S TIME.
 """
 
+import logging
 import re
 
 import numpy as np
-import requests
 from astropy import units as u
 from astropy.coordinates import SkyCoord, get_body_barycentric
 from astropy.time import Time
 
 from . import config as cfg
-from .irsa import BadResponse, query_catalog, with_retries
+from . import net
+from .irsa import BadResponse, query_catalog
 from .target import ALLWISE_BANDS, catalog_fluxes
+
+log = logging.getLogger(__name__)
 
 SIMBAD_URLS = ('https://simbad.harvard.edu/simbad/sim-id',       # mirror (the main CDS address has moved)
                'https://simbad.cds.unistra.fr/simbad/sim-id')
@@ -37,22 +40,21 @@ def resolve_star(name):
     parallax in mas, rv in km/s - each None if SIMBAD has none - magnitudes, spectral and object type)."""
     params = {'Ident': name, 'output.format': 'ASCII', 'output.console': 'off', 'output.script': 'off'}
 
-    def once():
-        last = None
-        for url in SIMBAD_URLS:
-            try:
-                response = requests.get(url, params=params, timeout=cfg.REQUEST_TIMEOUT)
-            except requests.RequestException as e:
-                last = e
-                continue
-            if response.status_code == 200 and 'Coordinates(ICRS' in response.text:
-                return response.text
-            if response.status_code == 200 and '!!' in response.text:
-                raise ValueError(f'SIMBAD does not know "{name}": {response.text.strip().splitlines()[-1][:150]}')
-            last = f'HTTP {response.status_code}'
-        raise BadResponse(f'SIMBAD unreachable ({last})')
+    def check(content):                     # an entry, or SIMBAD's "not found" answer - anything else is retried
+        if b'Coordinates(ICRS' not in content and b'!!' not in content:
+            raise BadResponse('not a SIMBAD answer')
 
-    return parse_simbad(with_retries(f'SIMBAD "{name}"', once), name)
+    last = None
+    for url in SIMBAD_URLS:                 # the mirror first; the main CDS address if the mirror is down
+        try:
+            text = net.get(url, params, service='cds', label=f'SIMBAD "{name}"', check=check).decode(errors='replace')
+        except (RuntimeError, net.Refused) as e:
+            last = e
+            continue
+        if 'Coordinates(ICRS' not in text:
+            raise ValueError(f'SIMBAD does not know "{name}": {text.strip().splitlines()[-1][:150]}')
+        return parse_simbad(text, name)
+    raise RuntimeError(f'SIMBAD unreachable ({last})')
 
 
 def _numbers(text, label, count):
@@ -88,7 +90,7 @@ def parse_simbad(text, name):
             'parallax': parallax, 'rv': rv, 'magnitudes': magnitudes,
             'spectral_type': spectral.group(1) if spectral and spectral.group(1) != '~' else '?'}
     pm = np.hypot(pmra or 0, pmdec or 0)
-    print(f"{star['name']} ({star['spectral_type']}, SIMBAD type {star['object_type']}): proper motion {pm / 1000:.2f}\"/yr, "
+    log.info(f"{star['name']} ({star['spectral_type']}, SIMBAD type {star['object_type']}): proper motion {pm / 1000:.2f}\"/yr, "
           f"parallax {parallax if parallax is not None else '?'} mas"
           + (f" ({1000 / parallax:.2f} pc)" if parallax else '') + f", radial velocity {rv if rv is not None else '?'} km/s")
     return star
@@ -155,7 +157,7 @@ def contamination_check(star, mjd, sed=None):
     try:
         table = query_catalog(here, 'catwise_2020', (radius_arcsec + reach + 10) * u.arcsec)
     except (RuntimeError, KeyError) as e:
-        print(f'Contamination check: CatWISE not available ({e})')
+        log.info(f'Contamination check: CatWISE not available ({e})')
         return []
     years = (mjd - CATWISE_EPOCH_MJD) / 365.25
     flux = lambda mag, zero: zero * 10 ** (-0.4 * float(mag)) * 1e3 if not np.ma.is_masked(mag) else np.nan
@@ -181,17 +183,17 @@ def contamination_check(star, mjd, sed=None):
             target = (allwise['WISE W1'], allwise['WISE W2'])
     note = f' (the target itself appears as {fragments} CatWISE entries along its path)' if fragments > 1 else ''
     if not others:
-        print(f'Contamination check: no other CatWISE source inside the measuring circle ({radius_arcsec:.0f}"){note}')
+        log.info(f'Contamination check: no other CatWISE source inside the measuring circle ({radius_arcsec:.0f}"){note}')
         return others
     total_w1, total_w2 = np.nansum([o[2] for o in others]), np.nansum([o[3] for o in others])
-    print(f'Contamination check: {len(others)} other source(s) inside the measuring circle ({radius_arcsec:.0f}"){note}:')
+    log.info(f'Contamination check: {len(others)} other source(s) inside the measuring circle ({radius_arcsec:.0f}"){note}:')
     for name, separation, w1, w2 in others:
-        print(f'    CatWISE {name} at {separation:.1f}": W1 {w1:.3f} mJy, W2 {w2:.3f} mJy')
+        log.info(f'    CatWISE {name} at {separation:.1f}": W1 {w1:.3f} mJy, W2 {w2:.3f} mJy')
     if target:
-        print(f'  target itself: W1 {target[0]:.3f} mJy, W2 {target[1]:.3f} mJy -> the others add '
+        log.info(f'  target itself: W1 {target[0]:.3f} mJy, W2 {target[1]:.3f} mJy -> the others add '
               f'{total_w1 / target[0] * 100:.0f}% at W1 (3.4 um) and {total_w2 / target[1] * 100:.0f}% at W2 (4.6 um)')
         if total_w1 > 0.1 * target[0] or total_w2 > 0.1 * target[1]:
-            print('  WARNING: measurements at the target are contaminated - especially at short wavelengths, where '
+            log.info('  WARNING: measurements at the target are contaminated - especially at short wavelengths, where '
                   'the target may be much fainter than its neighbours. Positions may follow the neighbour.')
     return others
 
@@ -216,5 +218,5 @@ def catalog_sed(star):
         if len(wise):
             sed += catalog_fluxes(wise[0], ALLWISE_BANDS)
     except RuntimeError as e:
-        print(f'  (AllWISE not available: {e})')
+        log.info(f'  (AllWISE not available: {e})')
     return sed

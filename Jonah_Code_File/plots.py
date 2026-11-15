@@ -1,5 +1,6 @@
 """Figures: a frame viewer for every image, movement and brightness over time, and the spectrum check."""
 
+import logging
 import textwrap
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -20,6 +21,8 @@ from .frames import pause_measuring, zoom_original
 from .irsa import fetch_cutout
 from .measure import bad_pixel_mask, reliable_frames, robust_scatter, usable_frames
 from .visual import PALETTE_STOPS, anchors, colour_of, find_partners, render, target_xy
+
+log = logging.getLogger(__name__)
 
 MAX_GRID_PANELS = 30        # show_frames draws one panel per frame; for more frames use show_viewer
 WAVELENGTH_RANGE = (0.75, 5.0)   # SPHEREx's wavelengths (um): fixed color scale for the live view
@@ -264,13 +267,14 @@ def _dark_axes(ax):
 
 
 def _colour_key(cax, zoom, partner):
-    """What the colours mean for this frame: a strip of the palette, labelled with the two wavelengths compared."""
-    cax.clear()
-    strip = colour_of(np.linspace(PALETTE_STOPS[0], PALETTE_STOPS[-1], 128))[:, None, :]
-    cax.imshow(strip, origin='lower', aspect='auto', extent=(0, 1, PALETTE_STOPS[0], PALETTE_STOPS[-1]))
-    cax.set_xticks([])
-    cax.yaxis.tick_right()
-    cax.tick_params(colors='white', labelsize=7)
+    """What the colours mean for this frame: a strip of the palette, labelled with the two wavelengths compared.
+    The strip is drawn once; later frames only change the labels."""
+    if not cax.images:
+        strip = colour_of(np.linspace(PALETTE_STOPS[0], PALETTE_STOPS[-1], 128))[:, None, :]
+        cax.imshow(strip, origin='lower', aspect='auto', extent=(0, 1, PALETTE_STOPS[0], PALETTE_STOPS[-1]))
+        cax.set_xticks([])
+        cax.yaxis.tick_right()
+        cax.tick_params(colors='white', labelsize=7)
     if partner is None:
         cax.set_yticks([0])
         cax.set_yticklabels(['no simultaneous\nframe: brightness\nonly'])
@@ -387,8 +391,14 @@ def draw_map(ax, display, entries):
     ny, nx = display['image'].shape
     small = ny > 2 * cfg.ZOOM_SIZE_PIX
     drawn, counts = [], {}
-    for entry in entries:
-        x, y = (float(v) for v in display['wcs'].world_to_pixel_values(entry['ra'], entry['dec']))
+    if not entries:
+        return drawn, 'mapped: nothing detected   - click an object, T = track it'
+    # every position converted in ONE call, and markers drawn as one artist per style (measured: one call and
+    # one artist per object took ~47 ms per frame)
+    xs, ys = (np.atleast_1d(v).astype(float) for v in display['wcs'].world_to_pixel_values(
+        np.array([e['ra'] for e in entries]), np.array([e['dec'] for e in entries])))
+    groups = {}                                             # style -> list of (x, y)
+    for x, y, entry in zip(xs, ys, entries):
         if not (-0.5 <= x < nx - 0.5 and -0.5 <= y < ny - 0.5):
             continue
         kind = entry['kind']
@@ -396,29 +406,39 @@ def draw_map(ax, display, entries):
         counts[key] = counts.get(key, 0) + 1
         color = MAP_STYLE.get(key, {'color': 'white'})['color']
         if kind == 'star':
+            style = ('named',) if entry.get('named') else ('gaia' if entry['source'] == 'Gaia' else 'catwise', color)
             if entry.get('named'):
-                ax.scatter([x], [y], marker='*', s=60 if not small else 25, facecolor='none', edgecolor='white', lw=0.9, zorder=6)
                 ax.annotate(entry['label'], (x, y), xytext=(6, 4), textcoords='offset points', color='white',
                             fontsize=7, zorder=8)
-            else:
-                ax.scatter([x], [y], marker='+' if entry['source'] == 'Gaia' else 'x', s=12 if small else 28,
-                           color=color, lw=0.9, zorder=5)
         elif kind == 'artifact':
-            ax.scatter([x], [y], marker='s', s=30, facecolor='none', edgecolor=color, lw=0.8, zorder=5)
+            style = ('artifact', color)
         elif kind == 'new':                                 # not in ANY catalog: impossible to miss
-            # (sizes in screen points, so it is just as visible in the wide view)
-            ax.scatter([x], [y], s=NEW_MARKER_SIZE * 2.2, facecolor='none', edgecolor=color, lw=7, alpha=0.25, zorder=7)
-            ax.scatter([x], [y], s=NEW_MARKER_SIZE, facecolor='none', edgecolor=color, lw=2.6, zorder=8)
+            style = ('new', color)
             ax.annotate(entry['label'].replace(' (', '\n('), (x, y), xytext=(14, 10), textcoords='offset points',
                         color='black', fontsize=8, fontweight='bold', zorder=9,
                         bbox=dict(boxstyle='round,pad=0.25', facecolor=color, edgecolor='none', alpha=0.95),
                         arrowprops=dict(arrowstyle='-', color=color, lw=1.4))
         else:                                               # small body / planet
-            ax.scatter([x], [y], marker='D', s=45, facecolor='none', edgecolor=color, lw=1.3, zorder=7)
+            style = ('body', color)
             name = entry['label'].split('(')[0].strip() or entry['label']
             ax.annotate(name + ('' if entry.get('detected') else ' (not detected)'), (x, y), xytext=(6, 5),
                         textcoords='offset points', color=color, fontsize=7, zorder=8)
-        drawn.append((x, y, entry))
+        groups.setdefault(style, []).append((x, y))
+        drawn.append((float(x), float(y), entry))
+    for style, points in groups.items():
+        px, py = np.array(points).T
+        if style[0] == 'named':
+            ax.scatter(px, py, marker='*', s=25 if small else 60, facecolor='none', edgecolor='white', lw=0.9, zorder=6)
+        elif style[0] in ('gaia', 'catwise'):
+            ax.scatter(px, py, marker='+' if style[0] == 'gaia' else 'x', s=12 if small else 28, color=style[1],
+                       lw=0.9, zorder=5)
+        elif style[0] == 'artifact':
+            ax.scatter(px, py, marker='s', s=30, facecolor='none', edgecolor=style[1], lw=0.8, zorder=5)
+        elif style[0] == 'new':     # (sizes in screen points, so it is just as visible in the wide view)
+            ax.scatter(px, py, s=NEW_MARKER_SIZE * 2.2, facecolor='none', edgecolor=style[1], lw=7, alpha=0.25, zorder=7)
+            ax.scatter(px, py, s=NEW_MARKER_SIZE, facecolor='none', edgecolor=style[1], lw=2.6, zorder=8)
+        else:
+            ax.scatter(px, py, marker='D', s=45, facecolor='none', edgecolor=style[1], lw=1.3, zorder=7)
     ax.set_xlim(-0.5, nx - 0.5)
     ax.set_ylim(-0.5, ny - 0.5)
     parts = [f"{counts[k]} {label}" for k, label in (('Hipparcos', 'Hipparcos'), ('Gaia', 'Gaia DR3 (+)'),
@@ -499,7 +519,10 @@ def show_viewer(zooms, tracked, movement, brightness=None, pretty=None):
     cbar_ax = fig.add_axes(layout['cbar'])
     status = fig.text(layout['status_x'], 0.075, '', ha='center', fontsize=8, color='0.8' if pretty else '0.3')
     state = {'ax': None, 'i': 0, 'wide': False, 'catalog': has_map, 'waiting': set(), 'drawn': [], 'selected': None,
-             'selected_positions': {}}
+             'selected_positions': {}, 'blit': bool(getattr(fig.canvas, 'supports_blit', False))}
+    for artist in (cbar_ax, status, slider.ax):
+        artist.set_animated(state['blit'])
+    slider.drawon = False                                   # (the slider is redrawn by refresh())
     pool = ThreadPoolExecutor(max_workers=3)
     jobs = {}
 
@@ -554,6 +577,7 @@ def show_viewer(zooms, tracked, movement, brightness=None, pretty=None):
         if state['ax'] is not None:
             state['ax'].remove()
         ax = state['ax'] = fig.add_axes(layout['image'], projection=display['wcs'])
+        ax.set_animated(state['blit'])
         im = draw_zoom(ax, display, i, n, zooms[0]['mjd'], movement, brightness, pretty=pretty,
                        partner=display_partner, anchor=anchor, factor=factor, marks=marks)
         if display is not zoom:
@@ -598,7 +622,31 @@ def show_viewer(zooms, tracked, movement, brightness=None, pretty=None):
             cbar_ax.clear()
             fig.colorbar(im, cax=cbar_ax, label='MJy/sr (zodi subtracted)')
         status.set_text('\n'.join(textwrap.fill(note, 120) for note in notes))
-        fig.canvas.draw_idle()
+        refresh()
+
+    # Blitting: everything that changes from frame to frame is 'animated' - left out of full redraws and drawn on
+    # top of a saved picture of the rest (legends, titles, slider track). A full redraw only happens when the
+    # window is shown or resized. (Measured: half of each full redraw went into text that never changes.)
+    def dynamic_artists():
+        return [a for a in (state['ax'], cbar_ax, status, state.get('circle_legend'), slider.ax) if a is not None]
+
+    def refresh():
+        canvas = fig.canvas
+        if not state['blit'] or state.get('background') is None:
+            canvas.draw_idle()
+            return
+        canvas.restore_region(state['background'])
+        for artist in dynamic_artists():
+            fig.draw_artist(artist)
+        canvas.blit(fig.bbox)
+
+    def on_full_draw(event):
+        if not state['blit']:
+            return
+        state['background'] = fig.canvas.copy_from_bbox(fig.bbox)
+        for artist in dynamic_artists():
+            fig.draw_artist(artist)
+        fig.canvas.blit(fig.bbox)
 
     def check_waiting():
         """Redraw once whatever the current frame is waiting for (download, catalog, JPL) has arrived."""
@@ -636,9 +684,9 @@ def show_viewer(zooms, tracked, movement, brightness=None, pretty=None):
             spec = track_spec(state['selected'], tracked, zooms[i]['mjd'])
             if spec['kind'] == 'none':
                 status.set_text(f"Can't track {spec['name']}: {spec['reason']}")
-                fig.canvas.draw_idle()
+                refresh()
             else:
-                print(f"\nTracking {spec.get('name', state['selected']['label'])} next...")
+                log.info(f"\nTracking {spec.get('name', state['selected']['label'])} next...")
                 request_track(spec)
                 plt.close('all')                           # main starts its analysis when the windows are closed
 
@@ -661,6 +709,22 @@ def show_viewer(zooms, tracked, movement, brightness=None, pretty=None):
     timer.start()
     fig.canvas.mpl_connect('close_event', lambda event: (timer.stop(), pool.shutdown(wait=False, cancel_futures=True)))
     state['circle_legend'] = fig.legend(handles=circle_legend(movement), loc='upper right', fontsize=9)
+    state['circle_legend'].set_animated(state['blit'])
+    fig.canvas.mpl_connect('draw_event', on_full_draw)
+
+    original_savefig = fig.savefig
+
+    def savefig(*args, **kwargs):
+        """Saving (also the toolbar's save button) draws everything: animated artists are otherwise left out."""
+        artists = dynamic_artists()
+        for artist in artists:
+            artist.set_animated(False)
+        try:
+            return original_savefig(*args, **kwargs)
+        finally:
+            for artist in artists:
+                artist.set_animated(state['blit'])
+    fig.savefig = savefig
     if pretty:                                              # (moved below the two-line title)
         state['circle_legend'].set_bbox_to_anchor((0.99, 0.925), transform=fig.transFigure)
     if has_map:                                             # what every sky-map marker means

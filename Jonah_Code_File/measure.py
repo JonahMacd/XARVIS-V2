@@ -1,5 +1,6 @@
 """Measurements: brightness, position, alignment check, movement, brightness changes, spectrum check."""
 
+import logging
 import numpy as np
 
 from astropy import units as u
@@ -8,6 +9,8 @@ from astropy.stats import sigma_clipped_stats
 from astropy.wcs.utils import proj_plane_pixel_area
 
 from . import config as cfg
+
+log = logging.getLogger(__name__)
 
 
 def reliable_frames(frames):
@@ -25,6 +28,20 @@ def usable_frames(frames):
     from_wings = np.array([f.get('position_method') == 'wings' for f in frames], dtype=bool)
     on_track = np.array([f.get('track', 'ok') == 'ok' for f in frames], dtype=bool)   # see locate_object
     return (detected | from_wings) & on_track
+
+
+def survey_visits(mjd, gap_days=None):
+    """Survey visit number (0, 1, 2 ...) of each time (MJD, any order): SPHEREx observes a patch of sky for a few
+    days to weeks, then returns months later - a gap longer than VISIT_GAP_DAYS starts a new visit. The one
+    definition of a visit used everywhere."""
+    gap_days = cfg.VISIT_GAP_DAYS if gap_days is None else gap_days
+    mjd = np.asarray(mjd, dtype=float)
+    if not mjd.size:
+        return np.zeros(0, dtype=int)
+    order = np.argsort(mjd)
+    visit = np.empty(len(mjd), dtype=int)
+    visit[order] = np.r_[0, np.cumsum(np.diff(mjd[order]) > gap_days)]
+    return visit
 
 
 def robust_scatter(values):
@@ -159,7 +176,8 @@ def measure_flux(frame, coord):
     """Brightness (mJy): sum inside the measurement circle minus the local background, measured in the
     ring around it (sigma-clipped so neighboring stars in the ring are ignored). Bad pixels are left out;
     returns (flux, error, number of bad pixels inside the circle)."""
-    x, y = frame['wcs'].world_to_pixel(coord)
+    ra, dec = (coord.ra.deg, coord.dec.deg) if hasattr(coord, 'ra') else coord     # SkyCoord or (ra, dec) degrees
+    x, y = frame['wcs'].world_to_pixel_values(ra, dec)
     return aperture_flux(frame, float(x), float(y))
 
 
@@ -327,11 +345,11 @@ def check_alignment(frames, field_stars):
 
     alignment = np.array([f['alignment_px'] for f in frames])
     if np.isnan(alignment).all():
-        print(f'Alignment check: not possible here - too few catalog reference stars in the zoom ({len(stars)}; a sparse '
+        log.info(f'Alignment check: not possible here - too few catalog reference stars in the zoom ({len(stars)}; a sparse '
               f'field). The pointing is still IRSA\'s, fitted over the whole detector.')
         return alignment
     bad = np.flatnonzero(alignment > cfg.ALIGNMENT_TOLERANCE_PIX)
-    print(f"Alignment check ({'OK' if not len(bad) else f'WARNING: {len(bad)} frames above tolerance'}): "
+    log.info(f"Alignment check ({'OK' if not len(bad) else f'WARNING: {len(bad)} frames above tolerance'}): "
           f"{len(stars)} catalog stars appear where SPHEREx's pointing puts them, to within "
           f'{np.nanmedian(alignment):.2f} px typical, {np.nanmax(alignment):.2f} px worst '
           f'({np.nanmedian(alignment) * cfg.PIXEL_ARCSEC:.2f}" / {np.nanmax(alignment) * cfg.PIXEL_ARCSEC:.2f}")'
@@ -352,7 +370,7 @@ def track_object(frames):
     and has no bad pixel in the circle are used: in the others its 'position' is just the brightest noise."""
     usable = usable_frames(frames)
     if not usable.any():
-        print(f'Movement: the object is not detected (signal-to-noise >= {cfg.DETECTION_SNR}) in any single frame, '
+        log.info(f'Movement: the object is not detected (signal-to-noise >= {cfg.DETECTION_SNR}) in any single frame, '
               f'so its position cannot be measured frame by frame')
         usable = reliable_frames(frames)
     first = int(np.flatnonzero(usable)[0]) if usable.any() else 0
@@ -380,7 +398,7 @@ def track_object(frames):
     largest = int(np.argmax(np.where(usable, offset, -1)))
 
     per_detector = ', '.join(f'D{d} {scatter[detector == d][0]:.2f}"' for d in np.unique(detector))
-    print(f'Movement vs T1: typical scatter per axis {per_detector}; largest offset {offset[largest]:.2f}" '
+    log.info(f'Movement vs T1: typical scatter per axis {per_detector}; largest offset {offset[largest]:.2f}" '
           f'({offset[largest] / cfg.PIXEL_ARCSEC:.2f} px) in T{largest + 1}. '
           + (f'FLAGGED ({int(flagged.sum())} frames): {", ".join(f"T{i + 1}" for i in np.flatnonzero(flagged)[:12])}'
              f'{" ..." if flagged.sum() > 12 else ""}' if flagged.any()
@@ -418,22 +436,22 @@ def track_moving(frames):
     days = np.array([f['mjd'] for f in frames]) - frames[0]['mjd']
     steps = found[detected][1:].separation(found[detected][:-1]).arcsec
     span = np.ptp(days[detected])
-    print(f'Asteroid detected in {int(detected.sum())} of {len(frames)} frames (signal-to-noise >= {cfg.DETECTION_SNR}). '
+    log.info(f'Asteroid detected in {int(detected.sum())} of {len(frames)} frames (signal-to-noise >= {cfg.DETECTION_SNR}). '
           f'Found within {np.median(residual[detected]):.1f}" (median) / {np.max(residual[detected]):.1f}" (worst) of its '
           f'ephemeris position ({np.median(residual[detected]) / cfg.PIXEL_ARCSEC:.2f} / '
           f'{np.max(residual[detected]) / cfg.PIXEL_ARCSEC:.2f} px).')
-    print(f'It travelled {steps.sum() / 3600:.1f} degrees across the sky in {span:.1f} days '
+    log.info(f'It travelled {steps.sum() / 3600:.1f} degrees across the sky in {span:.1f} days '
           f'(average {steps.sum() / 3600 / max(span, 1e-9):.2f} deg/day).'
           + (f' Off ephemeris: {", ".join(f"T{i + 1}" for i in np.flatnonzero(flagged)[:12])}'
              f'{"..." if flagged.sum() > 12 else ""}' if flagged.any() else ''))
 
     if (bright & ~detected).any():
-        print(f'  Not counted as detections: {int((bright & ~detected).sum())} frames with light at the predicted spot but '
+        log.info(f'  Not counted as detections: {int((bright & ~detected).sum())} frames with light at the predicted spot but '
               f'no source peak within {cfg.TRACK_TOLERANCE_PIX} px of it (another source, or blended) - '
               f'tracking: {track_counts(frames)}')
     moving_flags = sum(f.get('moving_flags', 0) > 0 for f, d in zip(frames, detected) if d)
     if detected.any():
-        print(f'  SPHEREx\'s own pipeline marked the asteroid\'s pixels as changing during the exposure '
+        log.info(f'  SPHEREx\'s own pipeline marked the asteroid\'s pixels as changing during the exposure '
               f'(OUTLIER/TRANSIENT flags - the sign of a moving source) in {moving_flags} of {int(detected.sum())} '
               f'detected frames')
 
@@ -492,14 +510,14 @@ def brightness_changes(frames, glow=False):
     noise = np.hypot(flux_err / reference, scatter)
     flagged = checkable & (np.abs(deviation) > cfg.BRIGHTNESS_SIGMA * noise)
     if (reliable & ~checkable).any():
-        print(f'  {int((reliable & ~checkable).sum())} frames have too few other frames at a similar wavelength '
+        log.info(f'  {int((reliable & ~checkable).sum())} frames have too few other frames at a similar wavelength '
               f'to judge their brightness')
 
     if not checkable.any():
-        print(f'{label} vs the object\'s own spectrum: not measurable - no frame has a usable brightness '
+        log.info(f'{label} vs the object\'s own spectrum: not measurable - no frame has a usable brightness '
               '(saturated, too faint, or bad pixels)')
     else:
-        print(f'{label} vs the object\'s own spectrum ({int(checkable.sum())} frames): typical deviation '
+        log.info(f'{label} vs the object\'s own spectrum ({int(checkable.sum())} frames): typical deviation '
               f'{scatter * 100:.1f}%. '
               + (f'FLAGGED ({flagged.sum()}): ' + ', '.join(f'T{i + 1} ({deviation[i] * 100:+.0f}%)'
                                                           for i in np.flatnonzero(flagged)[:15])
@@ -510,14 +528,14 @@ def brightness_changes(frames, glow=False):
         mjd = np.array([f['mjd'] for f in frames])
         order = np.argsort(mjd[checkable])
         times, values = mjd[checkable][order], deviation[checkable][order]
-        visit = np.r_[0, np.cumsum(np.diff(times) > 30)]
+        visit = survey_visits(times)
         parts = []
         for v in range(int(visit.max()) + 1):
             these = values[visit == v]
             error = 1.2533 * robust_scatter(these) / np.sqrt(len(these)) if len(these) >= 3 else np.nan
             parts.append(f'MJD {times[visit == v].min():.0f}: {np.median(these) * 100:+.0f}% +/- {error * 100:.0f}% ({len(these)})')
         precision = f' (method precision ~{cfg.GLOW_PRECISION * 100:.0f}% per frame, measured on a steady star)' if glow else ''
-        print(f'  per visit (median vs its own spectrum): ' + ';  '.join(parts) + precision)
+        log.info(f'  per visit (median vs its own spectrum): ' + ';  '.join(parts) + precision)
     return {'reference_mjy': reference, 'deviation': deviation, 'scatter': scatter, 'flagged': flagged,
             'used': checkable, 'source': 'glow' if glow else 'aperture'}
 
@@ -544,7 +562,7 @@ def spectrum_check(tracked, frames):
                        for f, ok in zip(frames, reliable) if ok and np.isfinite(f['flux_mjy'])])
     catalog = sorted(tracked['catalog_sed'], key=lambda p: p[1])
     if len(points) == 0:
-        print('Spectrum check: skipped - no frame with a measured brightness')
+        log.info('Spectrum check: skipped - no frame with a measured brightness')
         return None
     points = points[np.argsort(points[:, 0])]
 
@@ -555,7 +573,7 @@ def spectrum_check(tracked, frames):
         if inside.sum() >= 3 and flux > 0:
             bands.append((name, wavelength, float(np.median(points[inside, 1])) / flux, int(inside.sum())))
     if len(bands) < 3:
-        print(f'Spectrum check: skipped - SPHEREx overlaps only {len(bands)} catalog filter(s) with measured brightness')
+        log.info(f'Spectrum check: skipped - SPHEREx overlaps only {len(bands)} catalog filter(s) with measured brightness')
         return None
     ratios = np.array([b[2] for b in bands])
     scale = float(np.median(ratios))
@@ -563,7 +581,7 @@ def spectrum_check(tracked, frames):
 
     same_object = 0.4 <= scale <= 1.3 and scatter <= 0.25
     verdict = 'PASS - same object' if same_object else 'FAIL - may not be the catalog object'
-    print(f'Spectrum check ({verdict}): SPHEREx / catalog = {scale:.2f} on average, shape agrees to {scatter * 100:.0f}% '
+    log.info(f'Spectrum check ({verdict}): SPHEREx / catalog = {scale:.2f} on average, shape agrees to {scatter * 100:.0f}% '
           f'across {len(bands)} filters: ' + ', '.join(f'{n} {r:.2f}' for n, _, r, _ in bands))
     return {'points': points, 'catalog': catalog, 'bands': bands, 'scale': scale, 'scatter': scatter,
             'same_object': same_object}
@@ -600,11 +618,11 @@ def compare_with_catalog(frames, movement, star):
     t_all = years[usable]
     order = np.argsort(t_all)
     t_all = t_all[order]
-    visit = np.r_[0, np.cumsum(np.diff(t_all) * 365.25 > 30)]
+    visit = survey_visits(t_all * 365.25)
     n_visits = int(visit.max()) + 1 if len(t_all) else 0
     span = np.ptp(t_all) if len(t_all) > 1 else 0.0
     if usable.sum() < 10 or n_visits < 2 or span < 0.25:
-        print(f'Catalog comparison: too few detections over too short a time ({int(usable.sum())} frames, '
+        log.info(f'Catalog comparison: too few detections over too short a time ({int(usable.sum())} frames, '
               f'{n_visits} visits, {span * 365.25:.0f} days) to measure the proper motion')
         return result
 
@@ -631,12 +649,12 @@ def compare_with_catalog(frames, movement, star):
     total_spherex = np.hypot(result['pm_RA'][0], result['pm_Dec'][0])
     sigma = [abs(result[k][0] - result[k][2]) / result[k][1] for k in ('pm_RA', 'pm_Dec')]
     result['agreement_sigma'] = sigma
-    print(f"Catalog comparison ({int(usable.sum())} frames, {n_visits} visits over {span * 365.25:.0f} days): SPHEREx "
+    log.info(f"Catalog comparison ({int(usable.sum())} frames, {n_visits} visits over {span * 365.25:.0f} days): SPHEREx "
           f"positions are a median {result['median_residual_arcsec']:.2f}\" "
           f"({result['median_residual_arcsec'] / cfg.PIXEL_ARCSEC:.2f} px) from the catalog prediction.")
-    print(f"  Proper motion measured by SPHEREx: RA {result['pm_RA'][0]:8.0f} +/- {result['pm_RA'][1]:.0f} mas/yr   "
+    log.info(f"  Proper motion measured by SPHEREx: RA {result['pm_RA'][0]:8.0f} +/- {result['pm_RA'][1]:.0f} mas/yr   "
           f"Dec {result['pm_Dec'][0]:8.0f} +/- {result['pm_Dec'][1]:.0f} mas/yr   (total {total_spherex / 1000:.2f}\"/yr)")
-    print(f"  Catalog (SIMBAD/Gaia):            RA {result['pm_RA'][2]:8.0f}             Dec {result['pm_Dec'][2]:8.0f}"
+    log.info(f"  Catalog (SIMBAD/Gaia):            RA {result['pm_RA'][2]:8.0f}             Dec {result['pm_Dec'][2]:8.0f}"
           f"            (total {total_catalog / 1000:.2f}\"/yr)   -> differ by {sigma[0]:.1f} / {sigma[1]:.1f} sigma"
           + ('' if dof > 0 else '  (only 2 visits: uncertainty may be underestimated)'))
     return result
@@ -680,7 +698,7 @@ def detection_summary(frames):
         weights = 1 / error[use] ** 2
         return np.sum(values[use] * weights) / np.sum(weights)
 
-    print(f'Detection: in {int(np.sum(snr >= cfg.DETECTION_SNR))} of {len(frames)} single frames '
+    log.info(f'Detection: in {int(np.sum(snr >= cfg.DETECTION_SNR))} of {len(frames)} single frames '
           f'(signal-to-noise >= {cfg.DETECTION_SNR}). Combining frames per band, against {CONTROL_COUNT} empty-sky controls:')
     rows = []
     for lo, hi in DETECTION_BANDS_UM:
@@ -696,11 +714,11 @@ def detection_summary(frames):
         rows.append({'band_um': (lo, hi), 'frames': int(use.sum()), 'single_detections': int(np.sum(snr[use] >= cfg.DETECTION_SNR)),
                      'flux_mjy': float(target), 'noise_mjy': float(noise), 'significance': float(significance),
                      'formal_snr': float(formal)})
-        print(f'  {lo:.2f}-{hi:.2f} um: {int(use.sum()):3d} frames ({rows[-1]["single_detections"]:3d} detected singly)  '
+        log.info(f'  {lo:.2f}-{hi:.2f} um: {int(use.sum()):3d} frames ({rows[-1]["single_detections"]:3d} detected singly)  '
               f'combined {target:9.3f} mJy, control noise {noise:.3f} mJy -> {significance:6.1f} sigma'
               + ('  DETECTED' if significance >= cfg.DETECTION_SNR else ''))
     if not rows:
         saturated = sum(bool(f.get('saturated')) for f in frames)
-        print(f'  (no frame has a measurable brightness'
+        log.info(f'  (no frame has a measurable brightness'
               + (f': {saturated} of {len(frames)} are saturated - too bright for SPHEREx)' if saturated else ')'))
     return rows

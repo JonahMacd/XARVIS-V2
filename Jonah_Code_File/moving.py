@@ -6,6 +6,7 @@ IRSA's image search then finds the images whose footprint contained the asteroid
 exposure. Everything after that (cutouts, measurements, plots) reuses the star pipeline.
 """
 
+import logging
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -16,7 +17,10 @@ from astropy.time import Time
 from astroquery.jplhorizons import Horizons
 
 from . import config as cfg
-from .irsa import query_images_at, with_retries
+from . import net
+from .irsa import query_images_at
+
+log = logging.getLogger(__name__)
 
 SPHEREX_OBSERVER = '@-163182'       # JPL Horizons id of the SPHEREx spacecraft (observer = the telescope itself)
 JD_MINUS_MJD = 2400000.5
@@ -61,7 +65,7 @@ def fetch_ephemeris(asteroid, epochs, location='500'):
         return Horizons(id=asteroid, id_type='smallbody', location=location, epochs=epochs).ephemerides(
             quantities='1,3,9,19,20,23,24', cache=False)   # position, rates, brightness, distances, elongation, phase
 
-    return with_retries(f'Horizons {asteroid}', once)
+    return net.retry(f'Horizons {asteroid}', once, service='jpl')
 
 
 def find_asteroid(asteroid, window):
@@ -72,11 +76,11 @@ def find_asteroid(asteroid, window):
     ephemeris = Ephemeris(table)
     name = str(table['targetname'][0]).split('(')[0].strip()
     elong, rate = np.array(table['elong'], dtype=float), np.hypot(table['RA_rate'], table['DEC_rate']) * 24 / 3600
-    print(f"Tracking asteroid {name}: moves {np.median(rate):.2f} deg/day ({np.median(rate) * 3600 / 6.15 / 24:.0f} SPHEREx "
+    log.info(f"Tracking asteroid {name}: moves {np.median(rate):.2f} deg/day ({np.median(rate) * 3600 / 6.15 / 24:.0f} SPHEREx "
           f"pixels per hour), V = {np.min(table['V']):.1f} - {np.max(table['V']):.1f}, "
           f"{np.median(table['delta']):.2f} AU away")
     if not ((elong > 80) & (elong < 100)).any():
-        print(f"  WARNING: during this window the asteroid is {elong.min():.0f} - {elong.max():.0f} degrees from the Sun, "
+        log.info(f"  WARNING: during this window the asteroid is {elong.min():.0f} - {elong.max():.0f} degrees from the Sun, "
               f"but SPHEREx only looks at 82 - 98 degrees: it will probably not be in any image")
     return {'name': name, 'asteroid': asteroid, 'ephemeris': ephemeris, 'window': (start, stop)}
 
@@ -100,7 +104,7 @@ def find_images(tracked, spacing_deg=cfg.GRID_SPACING_DEG):
     samples = np.unique(np.clip(np.searchsorted(length, wanted), 0, len(length) - 1))
     samples = np.unique(np.r_[0, samples, len(length) - 1])
     ra, dec = ephemeris.position(ephemeris.mjd[samples])
-    print(f'Searching for SPHEREx images along {length[-1]:.1f} degrees of path ({len(samples)} position searches)...')
+    log.info(f'Searching for SPHEREx images along {length[-1]:.1f} degrees of path ({len(samples)} position searches)...')
 
     with ThreadPoolExecutor(max_workers=cfg.MAX_CONCURRENT_DOWNLOADS) as pool:
         tables = list(pool.map(query_images_at, ra, dec))
@@ -119,7 +123,7 @@ def find_images(tracked, spacing_deg=cfg.GRID_SPACING_DEG):
     images = candidates[caught]
     images['t_mid'] = t_mid[caught]
     images.sort('t_mid')
-    print(f'{len(images)} SPHEREx images contained the asteroid at the time of the exposure '
+    log.info(f'{len(images)} SPHEREx images contained the asteroid at the time of the exposure '
           f'(of {len(candidates)} that passed over the path during the window)')
     return images
 

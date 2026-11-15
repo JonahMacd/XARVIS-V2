@@ -1,5 +1,7 @@
 """Step 0: pick the star to track, and its catalog brightness for the spectrum check."""
 
+import logging
+
 import numpy as np
 
 from astropy import units as u
@@ -7,6 +9,8 @@ from astropy.coordinates import SkyCoord
 
 from . import config as cfg
 from .irsa import query_catalog
+
+log = logging.getLogger(__name__)
 
 # catalog bands: (magnitude column, error column, wavelength um, zero-magnitude flux in Jy)
 TWOMASS_BANDS = {'2MASS J': ('j_m', 'j_msigcom', 1.235, 1594.0),
@@ -65,5 +69,9 @@ def find_tracked_object(coord):
 
     in_zoom = positions.separation(position) <= zoom_half_width * np.sqrt(2)
     name = f"2MASS J{star['designation']}"
-    print(f"Tracking {name}: {star['dist_arcsec']:.1f}\" from the entered position, Ks = {ks[chosen]:.2f} mag")
-    return {'name': name, 'coord': position, 'catalog_sed': sed, 'field_stars': stars[in_zoom]}
+    magnitudes = {}
+    for band, (mag_col, err_col) in (('J', ('j_m', 'j_msigcom')), ('H', ('h_m', 'h_msigcom')), ('K', ('k_m', 'k_msigcom'))):
+        if not np.ma.is_masked(star[mag_col]):
+            magnitudes[band] = (float(star[mag_col]), 0.05 if np.ma.is_masked(star[err_col]) else float(star[err_col]))
+    log.info(f"Tracking {name}: {star['dist_arcsec']:.1f}\" from the entered position, Ks = {ks[chosen]:.2f} mag")
+    return {'name': name, 'coord': position, 'catalog_sed': sed, 'field_stars': stars[in_zoom], 'magnitudes': magnitudes}

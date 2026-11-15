@@ -21,12 +21,12 @@ history in the data (see classify_new):
 Every detection of every new object (coordinates and UTC time) is written to results/<target>_new_objects.csv.
 """
 
+import logging
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
-import requests
 from astropy import units as u
 from astropy.coordinates import SkyCoord, get_body, solar_system_ephemeris
 from astropy.table import Table
@@ -35,8 +35,10 @@ from astropy.time import Time
 from . import cache
 from . import config as cfg
 from .field import (GAIA_EPOCH_MJD, compare_frame, field_positions, known_small_bodies, query_field)
-from .irsa import BadResponse, with_retries
-from .measure import flag_bits
+from . import net
+from .measure import flag_bits, survey_visits
+
+log = logging.getLogger(__name__)
 
 HIP_EPOCH_MJD = 48348.5625                  # Hipparcos (new reduction) positions are for J1991.25
 VIZIER_URL = 'https://vizier.cfa.harvard.edu/viz-bin/asu-tsv'
@@ -49,18 +51,10 @@ ARTIFACT_FLAGS = ('GHOST', 'GHOST_FPA', 'GHOST_EXT', 'CROSSTALK', 'PERSIST', 'ST
 
 
 def _get(kind, key_parts, url, params=None, label='request'):
-    """GET with retries, cached on disk under `kind`."""
-    key = cache.make_key(url, *sorted((params or {}).items()), *key_parts)
-    content = cache.get(kind, key)
-    if content is None:
-        def once():
-            response = requests.get(url, params=params, timeout=60)
-            if response.status_code != 200:
-                raise BadResponse(f'HTTP {response.status_code}')
-            return response.content
-        content = with_retries(label, once, quiet=True)
-        cache.put(kind, key, content)
-    return content
+    """GET through net.py (the service's retries and limits), cached on disk under `kind`."""
+    service = 'jpl' if 'jpl.nasa.gov' in url else 'github' if 'github' in url else 'cds'
+    return net.get(url, params, service=service, label=label, cache_kind=kind, timeout=60,
+                   cache_key=cache.make_key(url, *sorted((params or {}).items()), *key_parts))
 
 
 # ----------------------------------------------------------------------------
@@ -104,7 +98,7 @@ def catalog_layer(coord, radius=None):
     try:
         hip, names = hipparcos(coord, radius), star_names()
     except RuntimeError as e:
-        print(f'  (Hipparcos / Stellarium names not available: {e})')
+        log.info(f'  (Hipparcos / Stellarium names not available: {e})')
         hip, names = Table(names=('hip', 'ra', 'dec', 'pmra', 'pmdec', 'parallax', 'hp')), {}
     rows = [dict(zip(field.colnames, [r[c] for c in field.colnames]), label=str(r['name']), hip=0) for r in field]
     gaia = [k for k, r in enumerate(rows) if r['source'] == 'Gaia']
@@ -131,7 +125,7 @@ def catalog_layer(coord, radius=None):
         field['label'], field['hip'] = np.array([], dtype=str), np.array([], dtype=int)
     table = Table(rows=rows) if rows else field
     n_named = sum(1 for r in rows if r['hip'] and '(' in r['label'])
-    print(f"Star catalogs: {sum(r['source'] == 'Gaia' for r in rows)} Gaia DR3, {len(hip)} Hipparcos "
+    log.info(f"Star catalogs: {sum(r['source'] == 'Gaia' for r in rows)} Gaia DR3, {len(hip)} Hipparcos "
           f"({n_named} with a common name), {sum(r['source'] == 'CatWISE' and not r['gaia_match'] for r in rows)} "
           f"CatWISE-only sources within {radius.to_value(u.arcmin):.1f}'")
     return table
@@ -168,7 +162,7 @@ def planets_in_view(coord, times, radius_deg):
                     found[planet] = [(float(m), float(r), float(d))
                                      for m, r, d in zip(t.mjd[near], body.ra.deg[near], body.dec.deg[near])]
     except Exception as e:                          # e.g. no internet for the one-time DE440s download
-        print(f'  (DE440s planetary ephemeris not available: {e})')
+        log.info(f'  (DE440s planetary ephemeris not available: {e})')
     return found
 
 
@@ -226,7 +220,7 @@ def small_bodies(frames, coord, radius_deg, priority=()):
     todo = groups[:cfg.SKYMAP_MAX_SB_CALLS]
     if not todo:
         return [], set()
-    print(f'Asking JPL SB Ident which known asteroids / comets were in the field ({len(todo)} call'
+    log.info(f'Asking JPL SB Ident which known asteroids / comets were in the field ({len(todo)} call'
           f'{"s" if len(todo) > 1 else ""} covering {sum(len(g) for g in todo)} of {len(frames)} frames, ~20 s; '
           f'cached for re-runs)...')
 
@@ -236,7 +230,7 @@ def small_bodies(frames, coord, radius_deg, priority=()):
         try:
             return known_small_bodies(mid, coord.ra.deg, coord.dec.deg, half_width_deg=min(half, 2.0))
         except Exception as e:
-            print(f'  JPL SB Ident failed for MJD {mid:.2f}: {e}')
+            log.info(f'  JPL SB Ident failed for MJD {mid:.2f}: {e}')
             return None
 
     with ThreadPoolExecutor(2) as pool:
@@ -265,11 +259,11 @@ def small_bodies(frames, coord, radius_deg, priority=()):
                                                    'orbit_class': '?'})
         _refine_with_horizons(body, mjd)
     if bodies:
-        print('Known small bodies in the field: ' + '; '.join(
+        log.info('Known small bodies in the field: ' + '; '.join(
             f"{b['fullname']} ({b['kind']}, {b['orbit_class']}, V {b['vmag']:.1f}) in {len(b['positions'])} frames"
             for b in bodies.values()))
     else:
-        print('Known small bodies in the field: none (at the times checked)')
+        log.info('Known small bodies in the field: none (at the times checked)')
     return list(bodies.values()), checked
 
 
@@ -287,7 +281,7 @@ def _refine_with_horizons(body, mjd):
             ra += list(table['RA'])
             dec += list(table['DEC'])
     except Exception as e:
-        print(f"  (Horizons position for {body['name']} not available, using JPL SB Ident's estimate: "
+        log.info(f"  (Horizons position for {body['name']} not available, using JPL SB Ident's estimate: "
               f"{str(e).splitlines()[0][:80] if str(e) else type(e).__name__})")
         return
     for k, i in enumerate(frames):
@@ -421,16 +415,9 @@ def _real_source(frame, x, y):
 # New objects: classify BEFORE labelling
 # ----------------------------------------------------------------------------
 
-def _visits(mjd, gap_days=20.0):
-    """Survey visit number of every frame (visits are separated by months)."""
-    order = np.argsort(mjd)
-    visit = np.zeros(len(mjd), dtype=int)
-    current = 0
-    for a, b in zip(order[:-1], order[1:]):
-        if mjd[b] - mjd[a] > gap_days:
-            current += 1
-        visit[b] = current
-    return visit
+def _visits(mjd):
+    """Survey visit number of every frame (measure.survey_visits: the one definition)."""
+    return survey_visits(mjd)
 
 
 def _covering(frames, ra, dec, margin=2):
@@ -475,8 +462,12 @@ def classify_new(frames, unexplained, checked=None):
             kind = 'transient' if len(covered_visits) > 1 else 'one visit only'
         else:
             kind = 'static' if seen_visits == covered_visits else 'variable'
+        depth = None
+        if kind in ('transient', 'variable'):        # missing in some visits: were they deep enough to see it?
+            depth = _depth_check(frames, ra, dec, covered, visit, set(seen_visits))
+            kind = depth['kind']
         objects.append({'kind': kind, 'ra': ra, 'dec': dec, 'detections': members, 'n_covered': len(covered),
-                        'visits_seen': seen_visits, 'visits_covered': covered_visits})
+                        'visits_seen': seen_visits, 'visits_covered': covered_visits, 'depth': depth})
     objects += _link_movers(singles, frames, visit)
     linked = {id(m) for o in objects if o['kind'] == 'moving' for m in o['detections']}
     group_of = {id(det[k]): int(group[k]) for k in range(len(det))}
@@ -503,12 +494,12 @@ def classify_new(frames, unexplained, checked=None):
                         'both_arms': len(arms) == 2, 'n_covered': len(_covering(frames, best['ra'], best['dec'])),
                         'visits_seen': [int(visit[best['frame']])], 'visits_covered': []})
     if glitches:
-        print(f'  ({glitches} one-instant detection(s) dropped as probable cosmic rays: seen by one detector arm only, '
+        log.info(f'  ({glitches} one-instant detection(s) dropped as probable cosmic rays: seen by one detector arm only, '
               f'while the other arm imaged the same spot at the same instant and saw nothing)')
     for obj in objects:
         obj['jpl_checked'] = all(m['frame'] in (checked or ()) for m in obj['detections'])
 
-    order = {'moving': 0, 'transient': 1, 'variable': 2, 'single': 3, 'static': 4, 'one visit only': 5}
+    order = {'moving': 0, 'transient': 1, 'variable': 2, 'single': 3, 'too shallow': 4, 'static': 5, 'one visit only': 6}
     objects.sort(key=lambda o: (order.get(o['kind'], 9), -max(m['sigma'] for m in o['detections'])))
     for n, obj in enumerate(objects, 1):
         obj['id'] = f'NEW-{n}'
@@ -534,6 +525,42 @@ def _linear(fit, mjd):
     dec = fit['dec0'] + fit['rate_dec'] * dt
     ra = fit['ra0'] + fit['rate_ra'] * dt / np.cos(np.radians(dec))
     return ra % 360, dec
+
+
+def _depth_check(frames, ra, dec, covered, visit, seen_visits):
+    """Forced photometry at (ra, dec) in every frame that covered it. A source missing from some visits is only
+    'transient' if those visits were deep enough to see it: its brightness in the visits it was seen must be
+    >= 5x the noise of the other visits combined, and the other visits must measure nothing there (< 3 sigma).
+    If they measure something after all it is there but fainter ('variable', or 'static' when about as bright);
+    if they were too shallow: 'too shallow' (can't tell). (The visits see it at different wavelengths, so
+    'about as bright' is judged loosely.) Returns {'kind', 'seen_mjy', 'other_mjy', 'other_err', 'depth_sigma',
+    'other_text'}."""
+    from .measure import aperture_flux
+    seen, other = [], []
+    for i in covered:
+        x, y = (float(v) for v in frames[i]['wcs'].world_to_pixel_values(ra, dec))
+        flux, err, n_bad = aperture_flux(frames[i], x, y)
+        if n_bad == 0 and np.isfinite(flux) and np.isfinite(err) and err > 0:
+            (seen if visit[i] in seen_visits else other).append((flux, err))
+    if not seen or not other:
+        return {'kind': 'one visit only' if len(seen_visits) == 1 else 'variable', 'depth_sigma': 0.0,
+                'other_text': 'no usable measurement'}
+    seen_flux = float(np.median([f for f, _ in seen]))
+    weights = np.array([1 / e ** 2 for _, e in other])
+    other_flux = float(np.sum(weights * np.array([f for f, _ in other])) / weights.sum())
+    other_err = float(1 / np.sqrt(weights.sum()))
+    depth = seen_flux / other_err if other_err > 0 else 0.0
+    result = {'seen_mjy': seen_flux, 'other_mjy': other_flux, 'other_err': other_err, 'depth_sigma': depth,
+              'other_text': f'{other_flux:.2f} +/- {other_err:.2f} mJy (vs {seen_flux:.2f} mJy when seen)'}
+    if depth < 5:
+        result['kind'] = 'too shallow'
+    elif other_flux < 3 * other_err:
+        result['kind'] = 'transient' if len(seen_visits) == 1 else 'variable'
+    elif other_flux > 0.5 * seen_flux:
+        result['kind'] = 'static'                       # it IS there in the other visits, about as bright
+    else:
+        result['kind'] = 'variable'                     # there, but clearly fainter
+    return result
 
 
 def _link_movers(singles, frames, visit):
@@ -593,12 +620,19 @@ def _describe(obj):
     if obj['kind'] == 'moving':
         return (f"moving {obj['rate_arcsec_per_hour']:.1f}\"/hour on a straight line, {n} detections at {times} times - "
                 f"{known}: unknown solar-system object candidate")
+    depth = obj.get('depth') or {}
     if obj['kind'] == 'transient':
-        return (f"seen in 1 survey visit ({n} detections at {times} times), absent in {len(obj['visits_covered']) - 1} "
-                f"other visit(s) that covered it: likely TRANSIENT (or a very slow mover)")
+        return (f"seen in 1 survey visit ({n} detections at {times} times); the other visit(s) were deep enough to see "
+                f"it ({depth.get('depth_sigma', 0):.0f}x their noise) and measure {depth.get('other_text', 'nothing')} "
+                f"there: likely TRANSIENT (or a very slow mover)")
     if obj['kind'] == 'variable':
         return (f"same place in {len(obj['visits_seen'])} of {len(obj['visits_covered'])} visits that covered it "
-                f"({n} detections): likely VARIABLE, not in the catalogs")
+                f"({n} detections); {depth.get('other_text', 'fainter')} in the others: likely VARIABLE, not in the "
+                f"catalogs")
+    if obj['kind'] == 'too shallow':
+        return (f"seen in {len(obj['visits_seen'])} visit(s) ({n} detections), not in {len(obj['visits_covered']) - len(obj['visits_seen'])} "
+                f"other(s) - but those were too shallow to see it (it would be only {depth.get('depth_sigma', 0):.1f}x "
+                f"their noise): can't tell whether it is transient")
     if obj['kind'] == 'static':
         return (f"same place in all {len(obj['visits_seen'])} visits ({n} detections): steady source that is not in "
                 f"Gaia DR3 / Hipparcos / CatWISE - likely NOT transient")
@@ -625,7 +659,7 @@ def map_sky(frames, coord):
     mjd = np.array([f['mjd'] for f in frames])
     planets = planets_in_view(coord, mjd, radius)
     if planets:
-        print('Planets / Moon near the field (DE440s): ' + ', '.join(p.capitalize() for p in planets))
+        log.info('Planets / Moon near the field (DE440s): ' + ', '.join(p.capitalize() for p in planets))
     # first pass without asteroids: which frames have something unexplained? (they are checked with JPL first)
     unexplained = map_frames(frames, catalog, [], planets)
     bodies, checked = small_bodies(frames, coord, radius, priority={u_[0] for u_ in unexplained})
@@ -636,19 +670,19 @@ def map_sky(frames, coord):
         kinds = {}
         for o in new:
             kinds[o['kind']] = kinds.get(o['kind'], 0) + 1
-        print(f"NEW OBJECTS (in no catalog, not a known asteroid/comet/planet, not flagged as an artifact): "
+        log.info(f"NEW OBJECTS (in no catalog, not a known asteroid/comet/planet, not flagged as an artifact): "
               + ', '.join(f'{n} {k}' for k, n in kinds.items()))
         for o in new[:15]:
             first = min(o['detections'], key=lambda m: m['mjd'])
-            print(f"  {o['id']:7s} RA {o['ra']:10.5f}  Dec {o['dec']:+9.5f}  first seen "
+            log.info(f"  {o['id']:7s} RA {o['ra']:10.5f}  Dec {o['dec']:+9.5f}  first seen "
                   f"{Time(first['mjd'], format='mjd').utc.iso[:19]} UTC  - {o['description']}")
         if len(new) > 15:
-            print(f'  ... and {len(new) - 15} more (all in the new-objects file)')
+            log.info(f'  ... and {len(new) - 15} more (all in the new-objects file)')
     else:
-        print('NEW OBJECTS: none - every source SPHEREx detects here is a known star, asteroid, comet or planet')
+        log.info('NEW OBJECTS: none - every source SPHEREx detects here is a known star, asteroid, comet or planet')
     unchecked = len(frames) - len(checked)
     if unchecked and any(o['kind'] in ('single', 'moving') and not o.get('jpl_checked') for o in new):
-        print(f'  (note: {unchecked} frames were not checked against known asteroids (one JPL call per run); '
+        log.info(f'  (note: {unchecked} frames were not checked against known asteroids (one JPL call per run); '
               f'"single" / "moving" objects there could still be known ones - press J on that frame in the viewer)')
     return {'catalog': catalog, 'bodies': bodies, 'planets': planets, 'new_objects': new, 'checked': checked}
 

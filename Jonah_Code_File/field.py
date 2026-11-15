@@ -14,22 +14,23 @@ known solar-system objects.
 Nothing here changes the target's measurements - it only adds context.
 """
 
+import logging
 import json
 import threading
-import time as time_module
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
-import requests
 from astropy import units as u
 from astropy.coordinates import SkyCoord
 from astropy.table import Table, vstack
 from astropy.time import Time
 
-from . import cache
 from . import config as cfg
-from .irsa import BadResponse, _session, with_retries
-from .measure import centroid, significant_peaks
+from . import net
+from .irsa import gator
+from .measure import centroid, significant_peaks, survey_visits
+
+log = logging.getLogger(__name__)
 
 GAIA_EPOCH_MJD = 57388.0            # Gaia DR3 positions are for 2016.0
 CATWISE_EPOCH_MJD = 57170.0         # CatWISE2020: ~2015.4
@@ -43,20 +44,8 @@ FIELD_COLUMNS = {'gaia_dr3_source': 'source_id,ra,dec,pmra,pmdec,parallax,phot_g
 # ----------------------------------------------------------------------------
 
 def _gator(catalog, coord, radius_arcsec):
-    """One Gator cone search as an astropy Table (cached on disk like the image searches)."""
-    params = {'catalog': catalog, 'spatial': 'cone', 'objstr': f'{coord.ra.deg:.6f} {coord.dec.deg:.6f}',
-              'radius': f'{radius_arcsec:.0f}', 'radunits': 'arcsec', 'outfmt': 1, 'selcols': FIELD_COLUMNS[catalog]}
-    key = cache.make_key(cfg.GATOR_URL, *sorted(params.items()))
-    cached = cache.get('catalogs', key)
-    if cached is None:
-        def once():
-            response = _session().get(cfg.GATOR_URL, params=params)
-            if response.status_code != 200 or not response.text.lstrip().startswith(chr(92)):    # IPAC: starts with '\'
-                raise BadResponse(f'HTTP {response.status_code}')
-            return response.content
-        cached = with_retries(f'Catalog {catalog}', once)
-        cache.put('catalogs', key, cached)
-    return Table.read(cached.decode(), format='ipac')
+    """One Gator cone search with the columns the field comparison needs (cached; see irsa.gator)."""
+    return gator(catalog, coord, radius_arcsec, FIELD_COLUMNS[catalog])
 
 
 def query_field(coord, radius=None, quiet=False):
@@ -99,7 +88,7 @@ def query_field(coord, radius=None, quiet=False):
     if len(gaia_part) and len(wise_part):
         field['gaia_match'][len(gaia_part):] = _nearest_arcsec(wise_part, gaia_part) < 3.0
     if not quiet:
-        print(f'Field catalogs within {radius.to_value(u.arcmin):.1f}\': {len(gaia_part)} Gaia DR3 (RP <= {cfg.FIELD_GAIA_MAX_RP}), '
+        log.info(f'Field catalogs within {radius.to_value(u.arcmin):.1f}\': {len(gaia_part)} Gaia DR3 (RP <= {cfg.FIELD_GAIA_MAX_RP}), '
               f'{len(wise_part)} CatWISE (W1 <= {cfg.FIELD_W1_MAX}; {int((~field["gaia_match"][len(gaia_part):]).sum())} '
               f'without a Gaia counterpart)')
     return field
@@ -129,7 +118,7 @@ def field_positions(field, mjd):
 def describe_target(field, coord, mjd):
     """Print what the catalogs list at the target's position (at time `mjd`): the nearest Gaia and CatWISE source."""
     if not len(field):
-        print('Catalogs at the target: nothing in Gaia DR3 / CatWISE within the field')
+        log.info('Catalogs at the target: nothing in Gaia DR3 / CatWISE within the field')
         return
     ra, dec = field_positions(field, mjd)
     separation = SkyCoord(ra, dec, unit='deg').separation(coord).arcsec
@@ -142,7 +131,7 @@ def describe_target(field, coord, mjd):
             parts.append(f"{field['name'][k]} {separation[k]:.1f}\" away ({band} {field['mag'][k]:.2f}"
                          + (f', proper motion {pm:.0f} mas/yr' if pm > 0 else '') + ')')
     within = int((separation <= cfg.FIELD_MATCH_PIX * cfg.PIXEL_ARCSEC).sum())
-    print('Catalogs at the target: nearest ' + '; '.join(parts)
+    log.info('Catalogs at the target: nearest ' + '; '.join(parts)
           + f'. {within} catalog source(s) within {cfg.FIELD_MATCH_PIX * cfg.PIXEL_ARCSEC:.0f}" (one SPHEREx resolution element)')
 
 
@@ -201,7 +190,7 @@ def compare_frame(frame, field):
 # All frames: pointing vs Gaia, and sources no catalog knows
 # ----------------------------------------------------------------------------
 
-def field_summary(frames, field, target=None):
+def field_summary(frames, field, target=None, unknowns=True):
     """Compare every frame with the field catalogs (needs the frames' full pixels: run before make_zooms).
     `target` = the target's expected (ra, dec) per frame, so the target itself isn't listed as unknown.
     Sets frame['field_unmatched'] (number of unexplained peaks) and returns
@@ -222,18 +211,20 @@ def field_summary(frames, field, target=None):
     offsets = np.array(offsets).reshape(-1, 2)
     if len(offsets):
         median = np.median(offsets, axis=0)
-        print(f'Field vs Gaia DR3: {len(offsets)} source matches over {len(frames)} frames; SPHEREx positions agree with '
+        log.info(f'Field vs Gaia DR3: {len(offsets)} source matches over {len(frames)} frames; SPHEREx positions agree with '
               f'Gaia (moved to each frame\'s date) to {np.hypot(*median) * cfg.PIXEL_ARCSEC:.2f}" on average '
               f'(scatter {np.hypot(*[1.4826 * np.median(np.abs(o - m)) for o, m in zip(offsets.T, median)]) * cfg.PIXEL_ARCSEC:.2f}" per source)')
+    if not unknowns:                                    # (the sky map lists the unknown sources instead)
+        return {'offset_px': offsets, 'candidates': []}
     candidates = _group(detections, frames)
     if candidates:
         kinds = {}
         for c in candidates:
             kinds[c['kind']] = kinds.get(c['kind'], 0) + 1
-        print(f'Sources in no catalog (Gaia DR3 / CatWISE): ' + ', '.join(f'{n} {k}' for k, n in kinds.items())
+        log.info(f'Sources in no catalog (Gaia DR3 / CatWISE): ' + ', '.join(f'{n} {k}' for k, n in kinds.items())
               + '  (see field_candidates in the results; known asteroids are checked with JPL)')
     else:
-        print('Sources in no catalog (Gaia DR3 / CatWISE): none - every source SPHEREx detects here is a known one')
+        log.info('Sources in no catalog (Gaia DR3 / CatWISE): none - every source SPHEREx detects here is a known one')
     return {'offset_px': offsets, 'candidates': candidates}
 
 
@@ -245,6 +236,7 @@ def _group(detections, frames):
     sky = SkyCoord([d[1] for d in detections], [d[2] for d in detections], unit='deg')
     sigma = np.array([d[3] for d in detections])
     mjd = np.array([f['mjd'] for f in frames])
+    visit = survey_visits(mjd)
     group = -np.ones(len(detections), dtype=int)
     for k in np.argsort(-sigma):                        # brightest first: the group centres
         if group[k] >= 0:
@@ -261,8 +253,8 @@ def _group(detections, frames):
             x, y = f['wcs'].world_to_pixel(sky[g])
             if 2 <= x < f['image'].shape[1] - 2 and 2 <= y < f['image'].shape[0] - 2:
                 covered.append(i)
-        visits = np.unique(np.floor((mjd[index[members]] - mjd[0]) / 30))
-        visits_covered = np.unique(np.floor((mjd[covered] - mjd[0]) / 30))
+        visits = np.unique(visit[index[members]])
+        visits_covered = np.unique(visit[covered])
         if len(times) == 1:
             kind = 'single epoch'
         elif len(visits) == 1 and len(visits_covered) > 1:
@@ -288,33 +280,6 @@ def _group(detections, frames):
 _ident_lock = threading.Lock()
 _ident_results = {}
 
-# JPL's limit (measured, from its HTTP 429 reply): "20 requests per 5 minutes" for sb_ident.api. Requests are spaced
-# to stay under it - also across runs (the times of recent requests are kept next to the cache).
-SB_IDENT_LIMIT, SB_IDENT_WINDOW_S = 18, 300
-_sb_slot_lock = threading.Lock()
-
-
-def _sb_ident_slot():
-    """Wait until another SB Ident request fits within JPL's rate limit, and record it."""
-    path = cache.cache_dir().parent / 'jpl_sb_ident_requests.json'
-    with _sb_slot_lock:
-        try:
-            recent = [t for t in json.loads(path.read_text()) if time_module.time() - t < SB_IDENT_WINDOW_S]
-        except (OSError, ValueError):
-            recent = []
-        if len(recent) >= SB_IDENT_LIMIT:
-            wait = SB_IDENT_WINDOW_S - (time_module.time() - min(recent)) + 1
-            print(f'  JPL SB Ident: {len(recent)} requests in the last 5 minutes (JPL allows 20) - waiting {wait:.0f} s...')
-            time_module.sleep(max(wait, 0))
-            recent = [t for t in recent if time_module.time() - t < SB_IDENT_WINDOW_S]
-        recent.append(time_module.time())
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(recent))
-        except OSError:
-            pass
-
-
 def known_small_bodies(mjd, ra_deg, dec_deg, half_width_deg=None):
     """Known asteroids and comets within a box around (ra, dec) at time `mjd`, from JPL SB Ident (geocentric -
     SPHEREx is in low Earth orbit, a few arcseconds of parallax at most for near-Earth objects). Takes ~20 s;
@@ -327,29 +292,9 @@ def known_small_bodies(mjd, ra_deg, dec_deg, half_width_deg=None):
               'fov-dec-center': centre.dec.to_string(sep='-', precision=0, alwayssign=True, pad=True),
               'fov-ra-hwidth': f'{half:.4f}', 'fov-dec-hwidth': f'{half:.4f}', 'two-pass': 'true',
               'suppress-first-pass': 'true', 'req-elem': 'false', 'vmag-lim': cfg.SB_IDENT_VMAG_LIMIT}
-    key = cache.make_key(SB_IDENT_URL, *sorted(params.items()))
-    content = cache.get('sb_ident', key)
-    if content is None:
-        content, last = None, None
-        for attempt in range(3):
-            _sb_ident_slot()                                # JPL allows 20 requests per 5 minutes
-            try:
-                response = requests.get(SB_IDENT_URL, params=params, timeout=120)
-                if response.status_code == 200:
-                    content = response.content
-                    break
-                last = f'HTTP {response.status_code}'
-                if response.status_code == 429:             # over the limit anyway: wait as long as JPL asks
-                    wait = min(float(response.headers.get('Retry-After', 300) or 300), 300)
-                    print(f'  JPL SB Ident: rate limit reached - waiting {wait:.0f} s as JPL asks...')
-                    time_module.sleep(wait)
-                    continue
-            except requests.RequestException as e:
-                last = type(e).__name__
-            time_module.sleep(5 * 2 ** attempt)
-        if content is None:
-            raise RuntimeError(f'JPL SB Ident: no answer after 3 attempts ({last})')
-        cache.put('sb_ident', key, content)
+    # JPL allows 20 SB Ident requests per 5 minutes: net.py spaces them (service 'jpl-sb-ident')
+    content = net.get(SB_IDENT_URL, params, service='jpl-sb-ident', label='JPL SB Ident',
+                      cache_kind='sb_ident', timeout=120)
     data = json.loads(content)
     fields = data.get('fields_second') or data.get('fields_first') or []
     rows = data.get('data_second_pass') or data.get('data_first_pass') or []
@@ -385,7 +330,7 @@ def identify_async(key, mjd, ra_deg, dec_deg, half_width_deg=None, on_done=None)
         try:
             bodies = known_small_bodies(mjd, ra_deg, dec_deg, half_width_deg)
         except Exception as e:                          # never let a lookup crash the viewer
-            print(f'JPL SB Ident failed: {e}')
+            log.info(f'JPL SB Ident failed: {e}')
             bodies = []
         with _ident_lock:
             _ident_results[key] = bodies
@@ -406,13 +351,13 @@ def identify_candidates(candidates, max_calls=None):
     todo = [c for c in candidates if c['kind'] in ('single epoch', 'transient')][:max_calls]
     if not todo:
         return candidates
-    print(f'Asking JPL which known asteroids/comets were at {len(todo)} unexplained source(s) (~20 s)...')
+    log.info(f'Asking JPL which known asteroids/comets were at {len(todo)} unexplained source(s) (~20 s)...')
     with ThreadPoolExecutor(len(todo)) as pool:
         answers = list(pool.map(lambda c: _safe_bodies(c['mjd'], c['ra'], c['dec']), todo))
     for candidate, bodies in zip(todo, answers):
         close = [b for b in bodies or [] if b['offset_arcsec'] <= cfg.SB_IDENT_MATCH_ARCSEC]
         candidate['known_body'] = min(close, key=lambda b: b['offset_arcsec'])['name'] if close else None
-        print(f"  {candidate['kind']} at RA {candidate['ra']:.5f} Dec {candidate['dec']:+.5f} "
+        log.info(f"  {candidate['kind']} at RA {candidate['ra']:.5f} Dec {candidate['dec']:+.5f} "
               f"(T{candidate['frames'][0] + 1}, {candidate['sigma']:.0f} sigma): "
               + (f"known object {candidate['known_body']}" if candidate['known_body'] else
                  'no known asteroid or comet there' + (' (JPL lookup failed)' if bodies is None else '')))
@@ -423,5 +368,5 @@ def _safe_bodies(mjd, ra, dec):
     try:
         return known_small_bodies(mjd, ra, dec, half_width_deg=cfg.SB_IDENT_MATCH_ARCSEC / 3600 * 2)
     except Exception as e:
-        print(f'JPL SB Ident failed: {e}')
+        log.info(f'JPL SB Ident failed: {e}')
         return None

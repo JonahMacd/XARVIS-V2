@@ -33,7 +33,18 @@ class SpectrumAnalyzer:
         self.flux = np.array([f['flux_mjy'] for f in frames], dtype=float)
         self.flux_err = np.array([f['flux_err_mjy'] for f in frames], dtype=float)
         self.mjd = np.array([f['mjd'] for f in frames], dtype=float)
-        self._obs_to_idx = {str(f['obs_id']): i for i, f in enumerate(frames)}
+        # Both detector arms of one exposure share an obs_id, so an obs_id alone can be ambiguous:
+        # '<obs_id>/D<detector>' always names one frame; a bare obs_id only when it is unique.
+        self._obs_to_idx, ambiguous = {}, set()
+        for i, f in enumerate(frames):
+            self._obs_to_idx[f"{f['obs_id']}/D{f['detector']}"] = i
+            key = str(f['obs_id'])
+            if key in self._obs_to_idx:
+                ambiguous.add(key)
+            self._obs_to_idx[key] = i
+        self._ambiguous_obs = ambiguous
+        for key in ambiguous:
+            del self._obs_to_idx[key]
 
         # Precompute sorted reliable spectrum points for interpolation
         ok = (self.reliable & np.isfinite(self.wavelength) & np.isfinite(self.flux)
@@ -107,13 +118,17 @@ class SpectrumAnalyzer:
         return self.band_spectrum((self.mjd >= start_mjd) & (self.mjd <= end_mjd))
 
     def resolve_index(self, key):
-        """Accept either an integer frame index (0-based) or an `obs_id` string."""
+        """Accept an integer frame index (0-based), an `obs_id` string, or '<obs_id>/D<detector>' (needed when
+        both detector arms of that exposure are in the data - they share the obs_id)."""
         if isinstance(key, (int, np.integer)):
             if not (0 <= key < len(self.frames)):
                 raise IndexError(f'Frame index {key} out of range (0..{len(self.frames) - 1})')
             return int(key)
         if str(key) in self._obs_to_idx:
             return self._obs_to_idx[str(key)]
+        if str(key) in self._ambiguous_obs:
+            options = [k for k in self._obs_to_idx if k.startswith(f'{key}/D')]
+            raise KeyError(f'obs_id {key} names {len(options)} frames (both detector arms): use one of {options}')
         raise KeyError(f'Unknown obs_id: {key}')
 
     def expected_flux_at(self, wavelength_um, exclude_idx=None):
@@ -648,7 +663,8 @@ def launch(show_original=True, show_fit=False, **run_kwargs):
         if brightness is None: show_motion(frames,tracked,movement)
         else:
             show_time_series(frames,tracked,movement,brightness)
-            show_spectrum(results['spectrum'],tracked)
+            if results.get('spectrum'):     # None when the spectrum check was skipped (saturated / too faint)
+                show_spectrum(results['spectrum'],tracked)
     if show_fit:
         results['motion_fit'] = analyzer.motion_fit()
     plt.show()

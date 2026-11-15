@@ -8,6 +8,7 @@ and IRSA's image-search replies, compressed. Where: a local folder that OneDrive
 Set CACHE_ENABLED to false in config.json to never write anything; clear_cache() deletes it all.
 """
 
+import logging
 import hashlib
 import os
 import shutil
@@ -17,6 +18,8 @@ import zlib
 from pathlib import Path
 
 from . import config as cfg
+
+log = logging.getLogger(__name__)
 
 
 def cache_dir():
@@ -87,11 +90,11 @@ def prune(quiet=False):
         except OSError:                                     # in use by another program right now: skip it
             pass
     if not quiet:
-        print(f'Cache: {len(files) - deleted} files, {total / 1e6:.1f} MB in {root}'
+        log.info(f'Cache: {len(files) - deleted} files, {total / 1e6:.1f} MB in {root}'
               + (f' ({deleted} old files deleted)' if deleted else ''))
 
 
 def clear_cache():
     """Delete the whole cache."""
     shutil.rmtree(cache_dir(), ignore_errors=True)
-    print(f'Cache cleared: {cache_dir()}')
+    log.info(f'Cache cleared: {cache_dir()}')

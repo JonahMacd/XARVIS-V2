@@ -5,6 +5,7 @@ the analysis is fast). One file per target, replaced on every run, so results ne
 Open it with load_results(), or with any program that reads CSV-like text (it's an ECSV file).
 """
 
+import logging
 import json
 import re
 from datetime import datetime
@@ -15,11 +16,14 @@ from astropy.table import Table
 
 from . import config as cfg
 
+log = logging.getLogger(__name__)
+
 # per-frame measurements worth keeping (only the ones a frame actually has are saved)
 FRAME_COLUMNS = ['obs_id', 'date_obs', 'mjd', 'detector', 'wavelength_um', 'flux_mjy', 'flux_err_mjy', 'snr',
                  'n_bad_in_aperture', 'object_ra', 'object_dec', 'object_err_arcsec', 'expected_ra', 'expected_dec',
                  'alignment_px', 'rotation_deg', 'saturated', 'position_method', 'glow', 'track', 'track_sep_px',
-                 'astrometry_ok', 'psf_fwhm_arcsec', 'moving_flags', 'field_unmatched']
+                 'astrometry_ok', 'psf_fwhm_arcsec', 'moving_flags', 'field_unmatched',
+                 'aperture_correction', 'psf_chi2', 'centroid_ra', 'centroid_dec']
 
 
 def results_dir():
@@ -50,17 +54,20 @@ def save_results(results, settings):
     name = results['tracked']['name']
     table.meta.update(target=name, saved=datetime.now().isoformat(timespec='seconds'),
                       settings_json=json.dumps(_plain(settings)), **{k: str(v) for k, v in settings.items()})
+    star = results['tracked'].get('star') or {}
+    if star.get('parallax'):                    # (algorithm.star_motion_fit holds it fixed - see there)
+        table.meta['catalog_parallax_mas'] = float(star['parallax'])
     path = results_path(name)
     path.parent.mkdir(parents=True, exist_ok=True)
     table.write(path, format='ascii.ecsv', overwrite=True)
-    print(f'Results saved: {path} ({path.stat().st_size / 1e3:.0f} KB, {n} frames)')
+    log.info(f'Results saved: {path} ({path.stat().st_size / 1e3:.0f} KB, {n} frames)')
     sky = results.get('skymap')
     if sky:                                                 # the new objects' detections: coordinates + UTC times
         from .skymap import new_objects_table
         new = new_objects_table(sky['new_objects'], frames)
         new_path = path.with_name(path.stem + '_new_objects.csv')
         new.write(new_path, format='ascii.csv', overwrite=True)
-        print(f'New objects saved: {new_path} ({len(sky["new_objects"])} objects, {len(new)} detections '
+        log.info(f'New objects saved: {new_path} ({len(sky["new_objects"])} objects, {len(new)} detections '
               f'with coordinates and UTC times)')
     register(name, settings, n)
     return path
@@ -166,11 +173,11 @@ def rebuild_results(on_progress=None):
     for k, (name, settings) in enumerate(entries, 1):
         if on_progress:
             on_progress(f'Regenerating results {k}/{len(entries)}: {name}')
-        print(f'\n=== Regenerating results {k}/{len(entries)}: {name} ===')
+        log.info(f'\n=== Regenerating results {k}/{len(entries)}: {name} ===')
         try:
             run_settings(settings, show=False)
         except Exception as e:
-            print(f'  could not regenerate {name}: {type(e).__name__}: {e}')
+            log.info(f'  could not regenerate {name}: {type(e).__name__}: {e}')
 
 
 def load_results(name_or_path):
