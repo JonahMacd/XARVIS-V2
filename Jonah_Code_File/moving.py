@@ -95,8 +95,10 @@ def find_images(tracked, spacing_deg=cfg.GRID_SPACING_DEG):
     with ThreadPoolExecutor(max_workers=cfg.MAX_CONCURRENT_DOWNLOADS) as pool:
         tables = list(pool.map(query_images_at, ra, dec))
     candidates = vstack([t for t in tables if len(t)], metadata_conflicts='silent')
-    _, first = np.unique(np.array(candidates['obs_id'], dtype=str), return_index=True)
-    candidates = candidates[first]                           # the same image can cover several samples
+    # the same image can cover several samples: keep each once. (By file, not obs_id: the short- and long-
+    # wavelength detectors of one exposure share an obs_id - de-duplicating by it threw away half the images.)
+    _, first = np.unique(np.array(candidates['access_url'], dtype=str), return_index=True)
+    candidates = candidates[first]
 
     t_mid = 0.5 * (np.array(candidates['t_min'], dtype=float) + np.array(candidates['t_max'], dtype=float))
     in_window = (t_mid >= tracked['window'][0]) & (t_mid <= tracked['window'][1])

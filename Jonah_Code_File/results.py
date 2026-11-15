@@ -17,7 +17,8 @@ from . import config as cfg
 # per-frame measurements worth keeping (only the ones a frame actually has are saved)
 FRAME_COLUMNS = ['obs_id', 'date_obs', 'mjd', 'detector', 'wavelength_um', 'flux_mjy', 'flux_err_mjy', 'snr',
                  'n_bad_in_aperture', 'object_ra', 'object_dec', 'object_err_arcsec', 'expected_ra', 'expected_dec',
-                 'alignment_px', 'rotation_deg']
+                 'alignment_px', 'rotation_deg', 'saturated', 'position_method', 'glow', 'track', 'track_sep_px',
+                 'astrometry_ok', 'psf_fwhm_arcsec', 'moving_flags', 'field_unmatched']
 
 
 def results_dir():
@@ -35,8 +36,11 @@ def save_results(results, settings):
     table = Table()
     table['T'] = np.arange(1, n + 1)
     for column in FRAME_COLUMNS:
-        if column in frames[0]:
-            table[column] = [f[column] for f in frames]
+        if any(column in f for f in frames):
+            values = [f.get(column, np.nan) for f in frames]
+            if any(v is None or isinstance(v, str) for v in values):          # e.g. position_method may be None
+                values = [str(v) for v in values]
+            table[column] = values
     for prefix in ('movement', 'brightness'):
         for name, values in (results.get(prefix) or {}).items():
             if isinstance(values, np.ndarray) and values.shape == (n,):    # per-frame arrays only
