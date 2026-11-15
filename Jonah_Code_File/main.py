@@ -20,10 +20,6 @@ from .plots import LiveView, show_motion, show_spectrum, show_time_series, show_
 from .results import save_results
 from .stars import catalog_sed, contamination_check, position_at, positions_at, resolve_star
 from .target import find_tracked_object
-<<<<<<< HEAD
-=======
-
->>>>>>> c1d8aa66f425c25a7bebed24e1ed90e62e8a42ab
 
 MID_DATA_MJD = 61000.0          # ~2025-11, middle of the SPHEREx data so far: where to search for a moving star
 
@@ -119,8 +115,9 @@ def run_coords(coords=cfg.COORDS, max_images=cfg.MAX_IMAGES, show=True, zoom_onl
     return run_fixed_target(star, {'mode': 'coordinates', 'coords': str(coords)}, max_images, show, zoom_only)
 
 
-def field_check(frames, coord):
+def field_check(frames, coord, *, identify=True):
     """Every frame's sources vs Gaia DR3 / CatWISE, unexplained sources looked up at JPL (see field.py).
+    Set identify=False when the sky map will handle JPL lookup.
     Needs the full pixels (before make_zooms). Returns (field table, summary) - (None, None) if the catalogs
     can't be reached (never stops the run)."""
     if not cfg.FIELD_CHECK:
@@ -130,19 +127,20 @@ def field_check(frames, coord):
         field = query_field(coord)
         describe_target(field, coord, frames[0]['mjd'])
         summary = field_summary(frames, field, target=[(f['expected_ra'], f['expected_dec']) for f in frames])
-        identify_candidates(summary['candidates'])
+        if identify:
+            identify_candidates(summary['candidates'])
         return field, summary
     except RuntimeError as e:
         print(f'Field comparison with Gaia / CatWISE skipped: {e}')
         return None, None
 
 
-def sky_map(frames, coord):
+def sky_map(frames, coord, *, field=None):
     """Name every object in the frames and find the new ones (skymap.py). Needs the full pixels. None if the
     reference services can't be reached (never stops the run)."""
     from .skymap import map_sky
     try:
-        return map_sky(frames, coord)
+        return map_sky(frames, coord, field=field)
     except RuntimeError as e:
         print(f'Sky map skipped: {e}')
         return None
@@ -179,10 +177,22 @@ def run_fixed_target(star, settings, max_images=cfg.MAX_IMAGES, show=True, zoom_
         pointing_summary(frames)
         check_alignment(frames, tracked['field_stars'])        # verifies the pointing, never adjusts it
         detection = detection_summary(frames)                  # (needs the full pixels: before make_zooms)
-        tracked['field'], field = field_check(frames, now)     # vs Gaia / CatWISE / JPL (needs the full pixels)
+        want_map = settings.get('mode') == 'coordinates' or cfg.SKYMAP_FOR_ALL_TARGETS
+        # One catalog table and one automatic JPL search strategy per run.
+        tracked['field'], field = field_check(frames, now, identify=not want_map)
         sky = None
-        if settings.get('mode') == 'coordinates' or cfg.SKYMAP_FOR_ALL_TARGETS:
-            sky = tracked['skymap'] = sky_map(frames, now)      # name every object, find the new ones
+        if want_map:
+            sky = tracked['skymap'] = sky_map(frames, now, field=tracked['field'])
+            if sky is not None:
+                if tracked['field'] is None:
+                    tracked['field'] = sky['catalog']
+                if field is not None:
+                    from .field import reuse_sky_identifications
+                    reuse_sky_identifications(field['candidates'], sky, frames)
+            elif field is not None:
+                # If the sky map failed, leave the ordinary field check usable.
+                from .field import identify_candidates
+                identify_candidates(field['candidates'])
         movement = track_object(frames)                        # SPHEREx alone: position vs T1
         catalog_motion = compare_with_catalog(frames, movement, star)     # vs SIMBAD/Gaia proper motion
         brightness = brightness_changes(frames)                # brightness vs its own spectrum (variability)

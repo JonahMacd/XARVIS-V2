@@ -412,10 +412,11 @@ def identify_candidates(candidates, max_calls=None):
     for candidate, bodies in zip(todo, answers):
         close = [b for b in bodies or [] if b['offset_arcsec'] <= cfg.SB_IDENT_MATCH_ARCSEC]
         candidate['known_body'] = min(close, key=lambda b: b['offset_arcsec'])['name'] if close else None
+        candidate['jpl_status'] = ('lookup_failed' if bodies is None else 'positional_match' if close else 'no_match')
         print(f"  {candidate['kind']} at RA {candidate['ra']:.5f} Dec {candidate['dec']:+.5f} "
               f"(T{candidate['frames'][0] + 1}, {candidate['sigma']:.0f} sigma): "
               + (f"known object {candidate['known_body']}" if candidate['known_body'] else
-                 'no known asteroid or comet there' + (' (JPL lookup failed)' if bodies is None else '')))
+                 'JPL lookup failed' if bodies is None else 'no match in JPL search'))
     return candidates
 
 
@@ -425,3 +426,34 @@ def _safe_bodies(mjd, ra, dec):
     except Exception as e:
         print(f'JPL SB Ident failed: {e}')
         return None
+
+
+def reuse_sky_identifications(candidates, sky, frames):
+    """Reuse the sky map's already-fetched JPL predictions, without new requests.
+
+    A match requires a spacecraft-refined position at the candidate's own epoch.
+    A burst search that found no match is not an exhaustive exclusion; unsearched
+    frames are explicitly distinguished. The sky-map call budget remains in force.
+    """
+    checked = sky.get('checked', set())
+    for candidate in candidates:
+        if candidate['kind'] not in ('single epoch', 'transient'):
+            continue
+        indices = [i for i in candidate['frames']
+                   if abs(frames[i]['mjd'] - candidate['mjd']) * 86400 < 5]
+        target = SkyCoord(candidate['ra'], candidate['dec'], unit='deg')
+        matches = []
+        for body in sky.get('bodies', []):
+            for i in indices:
+                if not body.get('precise', {}).get(i) or i not in body['positions']:
+                    continue
+                sep = float(target.separation(SkyCoord(*body['positions'][i], unit='deg')).arcsec)
+                if sep <= cfg.SB_IDENT_MATCH_ARCSEC:
+                    matches.append((sep, body['name']))
+        candidate['known_body'] = min(matches)[1] if matches else None
+        candidate['jpl_status'] = ('positional_match' if matches else
+                                   'no_match_in_burst_search' if any(i in checked for i in indices)
+                                   else 'not_checked')
+    if candidates:
+        print('Field candidates: reused sky-map JPL evidence; unchecked candidates remain unconfirmed.')
+    return candidates

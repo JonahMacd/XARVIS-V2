@@ -96,11 +96,14 @@ def hipparcos(coord, radius):
     return Table(rows=rows or None, names=('hip', 'ra', 'dec', 'pmra', 'pmdec', 'parallax', 'hp'))
 
 
-def catalog_layer(coord, radius=None):
+def catalog_layer(coord, radius=None, *, field=None):
     """All catalog stars around `coord`, one row each, with the best name: Stellarium name (+HIP), HIP number,
     Gaia DR3 id or CatWISE name. Columns as field.query_field, plus 'label' and 'hip' (0 = none)."""
     radius = radius if radius is not None else cfg.FIELD_RADIUS
-    field = query_field(coord, radius, quiet=True)
+    if field is None:
+        field = query_field(coord, radius, quiet=True)
+    else:
+        field = field.copy()  # retain the original shared catalog unchanged
     try:
         hip, names = hipparcos(coord, radius), star_names()
     except RuntimeError as e:
@@ -276,22 +279,19 @@ def small_bodies(frames, coord, radius_deg, priority=()):
 def _refine_with_horizons(body, mjd):
     """Exact positions as seen from SPHEREx (JPL Horizons) for the frames a body is in; keeps the SB Ident
     estimate where Horizons can't answer."""
-    from .moving import EPOCHS_PER_REQUEST, JD_MINUS_MJD, SPHEREX_OBSERVER, fetch_ephemeris
+    from .moving import spacecraft_ephemeris
     frames = sorted(body['positions'])
-    epochs, back = np.unique(np.round(mjd[frames], 6), return_inverse=True)
+    if not frames:
+        return
     try:
-        ra, dec = [], []
-        for start in range(0, len(epochs), EPOCHS_PER_REQUEST):
-            table = fetch_ephemeris(body['des'], list(epochs[start:start + EPOCHS_PER_REQUEST] + JD_MINUS_MJD),
-                                    SPHEREX_OBSERVER)
-            ra += list(table['RA'])
-            dec += list(table['DEC'])
+        table = spacecraft_ephemeris(body['des'], mjd[frames])
+        ra, dec = table['RA'], table['DEC']
     except Exception as e:
         print(f"  (Horizons position for {body['name']} not available, using JPL SB Ident's estimate: "
               f"{str(e).splitlines()[0][:80] if str(e) else type(e).__name__})")
         return
     for k, i in enumerate(frames):
-        body['positions'][i] = (float(ra[back[k]]), float(dec[back[k]]))
+        body['positions'][i] = (float(ra[k]), float(dec[k]))
         body['precise'][i] = True
 
 
@@ -617,11 +617,11 @@ def _describe(obj):
 # Everything together, and the output table
 # ----------------------------------------------------------------------------
 
-def map_sky(frames, coord):
+def map_sky(frames, coord, *, field=None):
     """Map every object in the frames around `coord` (needs the full pixels: before make_zooms).
     Returns {'catalog', 'bodies', 'planets', 'new_objects'}; frame['map'] holds each frame's objects."""
     radius = cfg.ZOOM_SIZE_PIX / 2 * np.sqrt(2) * cfg.PIXEL_ARCSEC / 3600 + 0.01        # covers the cutouts
-    catalog = catalog_layer(coord)
+    catalog = catalog_layer(coord, field=field)
     mjd = np.array([f['mjd'] for f in frames])
     planets = planets_in_view(coord, mjd, radius)
     if planets:

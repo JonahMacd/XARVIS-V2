@@ -7,15 +7,18 @@ exposure. Everything after that (cutouts, measurements, plots) reuses the star p
 """
 
 from concurrent.futures import ThreadPoolExecutor
+from collections import OrderedDict
+from io import StringIO
+import threading
 
 import numpy as np
 from matplotlib.path import Path as Polygon
 
-from astropy.table import vstack
+from astropy.table import Table, vstack
 from astropy.time import Time
-from astroquery.jplhorizons import Horizons
 
 from . import config as cfg
+from . import cache
 from .irsa import query_images_at, with_retries
 
 SPHEREX_OBSERVER = '@-163182'       # JPL Horizons id of the SPHEREx spacecraft (observer = the telescope itself)
@@ -53,15 +56,85 @@ class Ephemeris:
         return np.r_[0.0, np.cumsum(step)]
 
 
-def fetch_ephemeris(asteroid, epochs, location='500'):
-    """JPL Horizons observer table (astropy Table) for `asteroid` as seen from `location`
-    ('500' = Earth's center). `epochs` = dict(start, stop, step) or a list of Julian dates (UT)."""
-    def once():
-        # cache=False: astroquery's own cache is never cleaned up (it had grown to 23 MB); these queries take ~1 s
-        return Horizons(id=asteroid, id_type='smallbody', location=location, epochs=epochs).ephemerides(
-            quantities='1,3,9,19,20,23,24', cache=False)   # position, rates, brightness, distances, elongation, phase
+# Serialize Horizons requests and reuse successful exact queries in memory and on disk.
+# Earth-centred path searches and spacecraft-centred measurements have separate keys.
+_HORIZONS_QUANTITIES = '1,3,9,19,20,23,24'
+_horizons_lock = threading.RLock()
+_horizons_tables = OrderedDict()
+_spacecraft_rows = OrderedDict()
 
-    return with_retries(f'Horizons {asteroid}', once)
+
+def fetch_ephemeris(asteroid, epochs, location='500'):
+    """Fetch a Horizons observer table once per exact request, using Xarvis's cache."""
+    target, location = str(asteroid).strip(), str(location)
+    epoch_key = tuple(sorted(epochs.items())) if isinstance(epochs, dict) else tuple(map(float, epochs))
+    key = cache.make_key('horizons-v1', target, location, _HORIZONS_QUANTITIES,
+                         'range' if isinstance(epochs, dict) else 'dates', epoch_key)
+    with _horizons_lock:
+        if key in _horizons_tables:
+            _horizons_tables.move_to_end(key)
+            return _horizons_tables[key].copy()
+        content = cache.get('horizons', key)
+        table = None
+        if content is not None:
+            try:
+                table = Table.read(content.decode().splitlines(), format='ascii.ecsv')
+            except (ValueError, TypeError, OSError):
+                pass
+        if table is None:
+            from astroquery.jplhorizons import Horizons  # only when an uncached request is needed
+            def once():
+                return Horizons(id=target, id_type='smallbody', location=location, epochs=epochs).ephemerides(
+                    quantities=_HORIZONS_QUANTITIES, cache=False)
+            table = with_retries(f'Horizons {target}', once)
+            # Do not let a failed cache write discard a valid ephemeris.
+            try:
+                buffer = StringIO()
+                table.write(buffer, format='ascii.ecsv')
+                cache.put('horizons', key, buffer.getvalue().encode())
+            except (OSError, ValueError, TypeError) as exc:
+                print(f'  Horizons cache write skipped: {exc}')
+        _horizons_tables[key] = table.copy()
+        if len(_horizons_tables) > 32:
+            _horizons_tables.popitem(last=False)
+        return table.copy()
+
+
+def spacecraft_ephemeris(asteroid, mjd):
+    """Exact spacecraft observer rows, returned in input order, including duplicates.
+
+    Shared by target tracking and sky-map refinement. Only missing epochs are
+    requested; retain geometry columns for later spectral modelling. No reuse
+    between different target IDs or observer locations.
+    """
+    target = str(asteroid).strip()
+    times = np.asarray(mjd, dtype=float)
+    if times.ndim != 1 or not len(times) or not np.isfinite(times).all():
+        raise ValueError('Provide a nonempty list of finite observation times.')
+    epochs, back = np.unique(np.round(times, 6), return_inverse=True)
+    with _horizons_lock:
+        rows = {float(t): _spacecraft_rows[(target, float(t))] for t in epochs
+                if (target, float(t)) in _spacecraft_rows}
+        missing = np.array([t for t in epochs if float(t) not in rows])
+        for start in range(0, len(missing), EPOCHS_PER_REQUEST):
+            batch = missing[start:start + EPOCHS_PER_REQUEST]
+            table = fetch_ephemeris(target, list(batch + JD_MINUS_MJD), SPHEREX_OBSERVER)
+            returned = np.asarray(table['datetime_jd'], float) - JD_MINUS_MJD
+            if (len(returned) != len(batch) or not np.isfinite(returned).all()
+                    or not np.isfinite(np.ma.filled(np.ma.asarray(table['RA'], dtype=float), np.nan)).all()
+                    or not np.isfinite(np.ma.filled(np.ma.asarray(table['DEC'], dtype=float), np.nan)).all()):
+                raise RuntimeError('Horizons returned an incomplete spacecraft ephemeris.')
+            order = np.argsort(returned)
+            if not np.allclose(returned[order], batch, rtol=0, atol=2e-7):
+                raise RuntimeError('Horizons returned unexpected observation times.')
+            for t, i in zip(batch, order):
+                row = table[int(i):int(i)+1].copy()
+                rows[float(t)] = row
+                _spacecraft_rows[(target, float(t))] = row
+        while len(_spacecraft_rows) > 8192:
+            _spacecraft_rows.popitem(last=False)
+        unique = vstack([rows[float(t)] for t in epochs], metadata_conflicts='silent')
+        return unique[back]
 
 
 def find_asteroid(asteroid, window):
@@ -131,13 +204,11 @@ def add_predicted_positions(images, tracked):
     if not tracked.get('asteroid'):
         images['target_ra'], images['target_dec'] = tracked['ephemeris'].position(np.array(images['t_mid'], dtype=float))
         return images
-    epochs, back = np.unique(np.round(np.array(images['t_mid'], dtype=float), 6), return_inverse=True)
-    ra, dec = [], []
-    for start in range(0, len(epochs), EPOCHS_PER_REQUEST):
-        batch = epochs[start:start + EPOCHS_PER_REQUEST] + JD_MINUS_MJD
-        table = fetch_ephemeris(tracked['asteroid'], list(batch), SPHEREX_OBSERVER)
-        ra += list(table['RA'])
-        dec += list(table['DEC'])
-    images['target_ra'] = np.array(ra, dtype=float)[back]
-    images['target_dec'] = np.array(dec, dtype=float)[back]
+    table = spacecraft_ephemeris(tracked['asteroid'], images['t_mid'])
+    images['target_ra'] = np.array(table['RA'], dtype=float)
+    images['target_dec'] = np.array(table['DEC'], dtype=float)
+    # Keep the exact observer geometry already paid for, in image-row order.
+    # For retained frames, match by access_url rather than assuming row order.
+    tracked['spacecraft_ephemeris'] = table
+    tracked['spacecraft_ephemeris_urls'] = np.array(images['access_url'], dtype=str)
     return images

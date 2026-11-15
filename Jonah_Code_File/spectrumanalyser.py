@@ -5,6 +5,7 @@ Library: SpectrumAnalyzer.from_results(main.run(show=False)).show_bands()
 Only this module needs replacing. No tracking or download logic is changed.
 """
 
+import textwrap
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Circle
@@ -46,7 +47,7 @@ class SpectrumAnalyzer:
     @classmethod
     def from_results(cls, results):
         """Convenience constructor accepting the dict returned by `main.run()`."""
-        return cls(
+        analyzer = cls(
             frames=results['frames'],
             brightness=results.get('brightness'),
             spectrum=results.get('spectrum'),
@@ -54,6 +55,9 @@ class SpectrumAnalyzer:
             movement=results.get('movement'),
             tracked=results.get('tracked'),
         )
+        analyzer.catalog_motion = results.get('catalog_motion')
+        analyzer.combined_detection = results.get('detection')
+        return analyzer
 
     def band_spectrum(self, indices=None):
         """A 102-channel target aperture spectrum, retaining empty channels as NaN.
@@ -80,6 +84,117 @@ class SpectrumAnalyzer:
             self.flux_err, detector, selected & self.reliable)
         return dict(wavelength_um=CENTERS.ravel().copy(), flux_mjy=mean,
                     flux_err_mjy=error, count=count)
+
+    def observation_groups(self, tolerance_seconds=5.0):
+        """Group near-simultaneous detector captures in chronological order.
+
+        Same five-second convention as visual.find_partners; compare every time
+        to the first capture in its group, not to the preceding capture. Missing
+        timestamps remain singleton observations. Original frame indices survive.
+        """
+        if not np.isfinite(tolerance_seconds) or tolerance_seconds <= 0:
+            raise ValueError('tolerance_seconds must be positive and finite')
+        groups = []
+        for i in np.argsort(self.mjd, kind='stable'):
+            if (groups and np.isfinite(self.mjd[i]) and
+                    (self.mjd[i] - self.mjd[groups[-1][0]]) * 86400 < tolerance_seconds):
+                groups[-1].append(int(i))
+            else:
+                groups.append([int(i)])
+        return [np.asarray(g, dtype=int) for g in groups]
+
+    def reference_mask(self, idx, indices=None):
+        """Usable reference frames, excluding the entire selected observation time.
+
+        `indices` is an optional boolean mask (e.g. the chosen reference days).
+        Exclude poor pointing and known bad aperture pixels. Do not require a
+        detection for each reference frame: that would bias faint-source fluxes.
+        """
+        idx = self.resolve_index(idx)
+        align = np.array([f.get('alignment_px', np.nan) for f in self.frames], float)
+        ok = (self.reliable & np.isfinite(self.wavelength) & (self.wavelength > 0)
+              & np.isfinite(self.flux) & np.isfinite(self.flux_err)
+              & (self.flux_err > 0) & np.isfinite(self.mjd)
+              & (self.mjd != self.mjd[idx])
+              & ~(np.isfinite(align) & (align > cfg.ALIGNMENT_TOLERANCE_PIX)))
+        if indices is not None:
+            mask = np.asarray(indices, dtype=bool)
+            if mask.shape != ok.shape:
+                raise ValueError('Reference mask must match the number of captures.')
+            ok &= mask
+        return ok
+
+    def capture_consistency(self, idx, reference_mask=None, *, epoch_ids=None):
+        """Secondary, independent spectral brightness check for one capture.
+
+        Compare with other observation times in the same detector and nominal
+        channel, within half a local channel spacing. Multiple captures at one
+        exact MJD (or optional grouped epoch ID) contribute only one median.
+        At least three other times are
+        required. The typical range is a heuristic: +/- 3 times the quadrature
+        combination of selected uncertainty and the larger of reference scatter
+        or typical reference measurement error. This is NOT an identity test or
+        a calibrated probability. Real variability, blends and systematics can
+        produce disagreements. A weak measurement cannot establish agreement.
+        """
+        idx = self.resolve_index(idx)
+        f = self.frames[idx]
+        out = dict(status='insufficient', title='Not enough information',
+                   reason='', n_epochs=0, reference_mjy=np.nan, lower_mjy=np.nan,
+                   upper_mjy=np.nan, deviation_sigma=np.nan)
+        def finish(status, title, reason):
+            out.update(status=status, title=title, reason=reason)
+            return out
+        if not self.reliable[idx]:
+            return finish('quality', 'Check image quality',
+                          'A bad pixel affects this brightness measurement.')
+        if (not np.isfinite(self.flux[idx]) or not np.isfinite(self.flux_err[idx])
+                or self.flux_err[idx] <= 0 or not np.isfinite(self.mjd[idx])):
+            return finish('quality', 'Check image quality',
+                          'The selected measurement or its uncertainty is unavailable.')
+        alignment = f.get('alignment_px', np.nan)
+        if np.isfinite(alignment) and alignment > cfg.ALIGNMENT_TOLERANCE_PIX:
+            return finish('quality', 'Check image alignment',
+                          'The telescope pointing may affect this measurement.')
+        d = int(f['detector'])
+        ch = int(channel_index(d, self.wavelength[idx]))
+        if ch < 0:
+            return finish('insufficient', 'Not enough information',
+                          'No nominal wavelength channel is available for this capture.')
+        local = ch % 17
+        centers = CENTERS[d-1]
+        spacing = min(np.diff(centers)[max(0,local-1):min(16,local+1)])
+        det = np.array([f['detector'] for f in self.frames])
+        ok = (self.reference_mask(idx, reference_mask) & (det == d)
+              & (channel_index(d, self.wavelength) == ch)
+              & (np.abs(self.wavelength-self.wavelength[idx]) <= spacing/2))
+        times = self.mjd if epoch_ids is None else np.asarray(epoch_ids)
+        if times.shape != self.mjd.shape:
+            raise ValueError('epoch_ids must match frame count')
+        epochs = np.unique(times[ok])
+        out['n_epochs'] = len(epochs)
+        if len(epochs) < 3:
+            return finish('insufficient', 'Not enough information',
+                          f'{len(epochs)} comparable observation times; need at least 3.')
+        epoch_flux = np.array([np.median(self.flux[ok & (times == t)]) for t in epochs])
+        epoch_err = np.array([np.median(self.flux_err[ok & (times == t)]) for t in epochs])
+        typical = float(np.median(epoch_flux))
+        spread = max(float(robust_scatter(epoch_flux)), float(np.median(epoch_err)))
+        noise = float(np.hypot(self.flux_err[idx], spread))
+        sig = float(abs(self.flux[idx]-typical)/noise)
+        out.update(reference_mjy=typical, lower_mjy=typical-3*noise,
+                   upper_mjy=typical+3*noise, deviation_sigma=sig)
+        if typical < 3*spread:
+            return finish('insufficient', 'Not enough information',
+                          'Other observations are too faint or variable for a clear check.')
+        if sig > 3:
+            return finish('review', 'Worth another look',
+                          f'Brightness differs from {len(epochs)} comparable observation times.')
+        if self.flux[idx] < 3*self.flux_err[idx]:
+            return finish('insufficient', 'Not enough information',
+                          'This capture is too faint for a confident comparison.')
+        return finish('consistent', 'Brightness looks consistent',
+                      f'Agrees with {len(epochs)} comparable observation times.')
 
     def show_bands(self, zooms=None, movement=None, tracked=None, *, size=41):
         """Open linked channel gallery and capture/spectrum/tracking detail.
@@ -321,6 +436,8 @@ CENTERS = np.array([
 [2.445,2.506,2.575,2.646,2.719,2.794,2.871,2.951,3.033,3.118,3.204,3.293,3.383,3.476,3.570,3.667,3.768],
 [3.834,3.867,3.901,3.936,3.970,4.005,4.041,4.076,4.112,4.148,4.184,4.221,4.257,4.294,4.331,4.368,4.405],
 [4.435,4.468,4.500,4.533,4.567,4.601,4.635,4.669,4.704,4.739,4.774,4.808,4.843,4.879,4.915,4.952,4.989]])
+# Consistent false-color detector identifiers (not visible infrared colors).
+DETECTOR_COLORS = ("#3366B0", "#C16A13", "#16805C", "#8752A3", "#007E94", "#B64868")
 LIMITS = np.array([[.743,1.116],[1.099,1.651],[1.636,2.421],[2.422,3.827],[3.815,4.427],[4.418,5.009]])
 
 
@@ -413,6 +530,266 @@ def weighted_image(images, variances, selection=None):
 
 
 
+# Verification is deliberately separate from tracking and historical consistency.
+# These are conservative screening rules, not calibrated identity probabilities.
+class ObjectVerification:
+    def __init__(self, analyzer, zooms, tracked, movement):
+        self.a, self.zooms = analyzer, zooms
+        self.tracked, self.movement = tracked or {}, movement or {}
+        self.moving = 'ephemeris' in self.tracked or 'asteroid' in self.tracked
+        self.known = self.moving or ('star' in self.tracked and
+                     self.tracked['star'].get('object_type') != 'sky position') or (
+                     'star' not in self.tracked and bool(self.tracked.get('catalog_sed')))
+        self.groups = analyzer.observation_groups()
+        self.epoch = np.empty(len(zooms), int)
+        for j, g in enumerate(self.groups): self.epoch[g] = j
+        self.controls = {}
+        self.catalog = self.tracked.get('catalog_sed') or []
+        self.templates = []
+        self.template_note = ''
+        self._load_templates()
+        f = analyzer.frames
+        self.quality = analyzer.reliable & np.array([
+            x.get('astrometry_ok', True) and not (np.isfinite(x.get('alignment_px', np.nan)) and
+            x['alignment_px'] > cfg.ALIGNMENT_TOLERANCE_PIX) for x in f])
+        self.snr = np.divide(analyzer.flux, analyzer.flux_err, out=np.full(len(f), np.nan),
+                             where=np.isfinite(analyzer.flux_err)&(analyzer.flux_err>0))
+        self.separation = np.array([self._distance(x.get('object_ra',np.nan),x.get('object_dec',np.nan),
+                          x.get('expected_ra',np.nan),x.get('expected_dec',np.nan)) for x in f])
+        self.peak = np.array([x.get('object_found',False) and x.get('track','ok') in ('ok','off') for x in f])
+        self.wings = np.array([x.get('object_found',False) and x.get('position_method')=='wings' for x in f])
+        self.detected = self.quality & self.peak & (self.snr >= getattr(cfg,'DETECTION_SNR',5))
+        self.position_usable = self.detected | (self.quality & self.peak & self.wings)
+        self.limit = getattr(cfg,'TRACK_TOLERANCE_PIX',1.5)*cfg.PIXEL_ARCSEC
+        self.on_position = self.position_usable & np.isfinite(self.separation) & (self.separation <= self.limit)
+        self.catalog_check = self._catalog_comparison(self.catalog) if self.known and not self.moving else None
+        self.competitors = self._field_candidates()
+        self.motion = self._motion()
+
+    @staticmethod
+    def _distance(ra, dec, ra2, dec2):
+        a,b,c,d = np.deg2rad([ra,dec,ra2,dec2])
+        h = np.sin((b-d)/2)**2 + np.cos(b)*np.cos(d)*np.sin((a-c)/2)**2
+        return float(np.rad2deg(2*np.arcsin(np.sqrt(np.clip(h,0,1))))*3600)
+
+    @staticmethod
+    def result(state, note): return dict(state=state,note=note)
+
+    def background(self, i):
+        """Same pipeline aperture and annulus, on unenhanced pixels. No source peaks in controls."""
+        if i in self.controls: return self.controls[i]
+        from .measure import aperture_flux, significant_peaks
+        z = self.zooms[i]; x,y = z['catalog_xy']; ny,nx = z['image'].shape
+        px,py,_ = significant_peaks(z,noise='pixel')
+        radius = max(10., float(cfg.ANNULUS_PIX[1])+cfg.APERTURE_RADIUS_PIX+1)
+        positions=[]; fluxes=[]
+        for angle in np.linspace(0,2*np.pi,16,endpoint=False):
+            cx,cy = x+radius*np.cos(angle),y+radius*np.sin(angle)
+            outer = cfg.ANNULUS_PIX[1]
+            if not (outer <= cx < nx-outer and outer <= cy < ny-outer): continue
+            if np.any(np.hypot(px-cx,py-cy) <= cfg.APERTURE_RADIUS_PIX+1): continue
+            if any(np.hypot(cx-u,cy-v)<2*cfg.APERTURE_RADIUS_PIX for u,v in positions): continue
+            f,e,bad = aperture_flux(z,cx,cy)
+            if bad==0 and np.isfinite(f) and np.isfinite(e) and e>0:
+                positions.append((cx,cy)); fluxes.append(f)
+        values=np.asarray(fluxes); excess=np.nan
+        if len(values)>=5 and np.isfinite(self.a.flux[i]) and self.a.flux_err[i]>0:
+            noise=max(float(robust_scatter(values)),float(self.a.flux_err[i]))
+            excess=(self.a.flux[i]-np.median(values))/noise
+        out=dict(positions=positions,fluxes=values,significance=excess)
+        self.controls[i]=out
+        return out
+
+    def _catalog_comparison(self, catalog):
+        """Approximate broad-filter comparison, not interpolated broadband photometry.
+        Require three epochs and several wavelengths spanning each filter; do not fit a free scale.
+        """
+        ranges=[(1.235,1.11,1.36),(1.662,1.50,1.80),(2.159,1.99,2.31),
+                (3.368,2.80,3.90),(4.618,4.00,5.10)]
+        a=self.a; det=np.array([f['detector'] for f in a.frames]); ratios=[]; rows=[]
+        valid=self.quality & np.isfinite(a.flux)&np.isfinite(a.flux_err)&(a.flux_err>0)
+        # Include weak measurements in the median (no positive-flux selection bias).
+        for name,w,f,e in catalog:
+            if not (np.isfinite([w,f,e]).all() and f>0 and e>=0): continue
+            center,lo,hi=min(ranges,key=lambda b:abs(b[0]-w))
+            if abs(center-w)>.08: continue
+            use=valid & (a.wavelength>=lo)&(a.wavelength<=hi)
+            if len(np.unique(self.epoch[use]))<3: continue
+            channels=np.unique(np.concatenate([np.atleast_1d(channel_index(d,a.wavelength[use&(det==d)])) for d in range(1,7)]))
+            if (channels>=0).sum()<3 or np.ptp(a.wavelength[use]) < .5*(hi-lo): continue
+            # Equal weight per populated channel, rather than repeated visits dominating a filter.
+            sed=a.band_spectrum(use); k=(sed['count']>0)&(sed['wavelength_um']>=lo)&(sed['wavelength_um']<=hi)
+            if k.sum()<3: continue
+            measured=float(np.median(sed['flux_mjy'][k])); uncertainty=float(np.median(sed['flux_err_mjy'][k]))
+            if measured < 3*uncertainty: continue
+            ratio=measured/f; ratios.append(ratio); rows.append((name,w,f,e,measured))
+        if len(rows)<3: return None
+        scale=float(np.median(ratios)); scatter=float(np.sqrt(np.mean((np.array(ratios)/scale-1)**2)))
+        return dict(rows=rows,scale=scale,scatter=scatter,compatible=bool(.4<=scale<=1.3 and scatter<=.25))
+
+    def _field_candidates(self):
+        """Use already retrieved catalogue positions and nearby 2MASS photometry, no new network calls."""
+        table=self.tracked.get('field_stars'); out=[]
+        if table is None: return out
+        try:
+            from .target import catalog_fluxes,TWOMASS_BANDS
+            f=self.a.frames[0]; ra,dec=f['expected_ra'],f['expected_dec']
+            for row in table:
+                sep=self._distance(float(row['ra']),float(row['dec']),ra,dec)
+                # The target itself (or catalog position within ~1 arcsec) is not a competitor.
+                if not 1.0<sep<= (cfg.APERTURE_RADIUS_PIX+1)*cfg.PIXEL_ARCSEC: continue
+                phot=catalog_fluxes(row,TWOMASS_BANDS)
+                out.append(dict(name=str(row['designation']),separation=sep,phot=phot,
+                                check=self._catalog_comparison(phot)))
+        except (KeyError,TypeError,ValueError,ImportError):
+            return out
+        return out
+
+    def _load_templates(self):
+        """Optional independently measured, absolute-flux spectral library. No bundled fake templates.
+        CSV next to module: name,role,wavelength_um,flux_mjy,flux_err_mjy,valid_from_mjd,valid_to_mjd.
+        Moving objects require explicit geometry/time validity. Static spectra may omit dates.
+        """
+        import csv
+        from pathlib import Path
+        path=Path(getattr(cfg,'VERIFICATION_REFERENCES',Path(__file__).with_name('verification_references.csv')))
+        if not path.is_file(): return
+        try:
+            groups={}
+            with path.open(newline='',encoding='utf-8-sig') as f:
+                for row in csv.DictReader(f):
+                    name=row['name'].strip(); role=row['role'].strip().lower()
+                    if role not in ('target','alternative') or not name: raise ValueError('invalid name or role')
+                    lo=float(row.get('valid_from_mjd') or '-inf'); hi=float(row.get('valid_to_mjd') or 'inf')
+                    if lo>hi or np.isnan([lo,hi]).any(): raise ValueError('invalid time range')
+                    w,v,e=map(float,(row['wavelength_um'],row['flux_mjy'],row['flux_err_mjy']))
+                    if not np.isfinite([w,v,e]).all() or w<=0 or v<=0 or e<=0: raise ValueError('invalid spectral point')
+                    groups.setdefault((name,role,lo,hi),[]).append((w,v,e))
+            for (name,role,lo,hi),points in groups.items():
+                p=np.asarray(sorted(points));
+                if len(p)<3 or np.any(np.diff(p[:,0])<=0): raise ValueError('need distinct wavelengths')
+                self.templates.append(dict(name=name,role=role,lo=lo,hi=hi,points=p))
+        except (OSError,ValueError,KeyError) as exc:
+            self.templates=[]; self.template_note='External reference file could not be read: '+str(exc)
+            print(self.template_note)
+
+    def _template_comparison(self, members):
+        """Compare candidates on exactly the same observed points, no extrapolation or scale fitting."""
+        a=self.a; indices=np.asarray(members,int)
+        indices=indices[self.on_position[indices]&self.detected[indices]&np.isfinite(a.wavelength[indices])]
+        if not len(indices): return []
+        times=a.mjd[indices]; wl=a.wavelength[indices]
+        available=[]
+        for t in self.templates:
+            if self.moving and not np.isfinite([t['lo'],t['hi']]).all(): continue
+            if t['role']=='target' and (not self.known or t['name'].casefold()!=str(self.tracked.get('name','')).casefold()): continue
+            p=t['points']; j=np.searchsorted(p[:,0],wl); j=np.clip(j,1,len(p)-1)
+            exact=np.isclose(wl,p[j,0],rtol=0,atol=1e-8)|np.isclose(wl,p[j-1,0],rtol=0,atol=1e-8)
+            ok=(times>=t['lo'])&(times<=t['hi'])&(wl>=p[0,0])&(wl<=p[-1,0])&((p[j,0]-p[j-1,0]<=.05*wl)|exact)
+            if len(np.unique([a.frames[i]['detector'] for i in indices[ok]]))>=3:
+                available.append((t,ok,np.interp(wl,p[:,0],p[:,1]),np.interp(wl,p[:,0],p[:,2])))
+        if not available: return []
+        common=np.logical_and.reduce([x[1] for x in available])
+        if len(np.unique([a.frames[i]['detector'] for i in indices[common]]))<3: return []
+        out=[]
+        for t,_,v,e in available:
+            z=(a.flux[indices[common]]-v[common])/np.hypot(a.flux_err[indices[common]],e[common])
+            out.append(dict(name=t['name'],role=t['role'],score=float(np.sqrt(np.mean(z*z))),compatible=bool(np.all(np.abs(z)<=3)),wavelength=wl[common],flux=v[common],error=e[common]))
+        return sorted(out,key=lambda x:x['score'])
+
+    def _motion(self):
+        if not self.known: return self.result('unavailable','No named target or predicted path.')
+        if not self.moving:
+            # Existing named-star proper-motion fit, if available. No flags alone are not evidence.
+            fit=getattr(self.a,'catalog_motion',None) or {}
+            sig=np.asarray(fit.get('agreement_sigma',[]),float)
+            if len(sig)==2 and np.isfinite(sig).all():
+                return self.result('review' if np.any(sig>3) else 'pass','Measured motion vs catalog prediction (whole run).')
+        groups=[g[self.on_position[g]] for g in self.groups if self.on_position[g].any()]
+        if len(groups)<3: return self.result('unavailable','Need three separate well-located observations.')
+        first,last=self.a.frames[groups[0][0]],self.a.frames[groups[-1][0]]
+        travel=self._distance(first['expected_ra'],first['expected_dec'],last['expected_ra'],last['expected_dec'])
+        if not np.isfinite(travel) or travel<2*self.limit:
+            return self.result('unavailable','Expected motion is too small to distinguish confidently.')
+        if np.any(self.position_usable & ~self.on_position): return self.result('review','Some measured locations differ from the predicted path.')
+        return self.result('pass','Source follows a clearly moving predicted path (whole run).')
+
+    def evaluate(self, members, history):
+        r=self.result; members=np.asarray(members,int)
+        if not len(members):
+            return dict(title='No observation selected',tone='unavailable',rows=[r('unavailable','Choose a populated channel.')]*6)
+        good=members[self.detected[members]]
+        bg=[self.background(int(i)) for i in good]
+        clears=[int(i) for i,b in zip(good,bg) if np.isfinite(b['significance']) and b['significance']>=5]
+        if clears: detection=r('pass',f'Stands above nearby sky in {len(clears)} image(s).')
+        elif len(good):
+            detection=r('review' if any(np.isfinite(b['significance']) for b in bg) else 'unavailable','Source signal not confirmed by nearby sky controls.')
+        elif np.any(self.wings[members]&self.position_usable[members]):
+            detection=r('unavailable','Bright core saturated; position from outer glow only.')
+        else:
+            combined=getattr(self.a,'combined_detection',None) or []
+            has_stack=any(b.get('significance',0)>=5 and b.get('formal_snr',0)>=5 for b in combined)
+            detection=r('unavailable','Not confirmed here; a combined detection exists.' if has_stack else 'No reliable source detected in this observation.')
+        loc=members[self.position_usable[members]]
+        if len(loc) and np.any(~self.on_position[loc]): position=r('review','A measured source is away from the expected position.')
+        elif len(loc): position=r('pass','Measured source is near the expected position.')
+        else: position=r('unavailable','No reliable position measurement.')
+        scores=self._template_comparison(members)
+        # Gaia/CatWISE sources are alternative positions, not independent spectra.
+        # Their positions are propagated to the observed date when the catalog is available.
+        field_names=set()
+        field=self.tracked.get('field')
+        if field is not None and len(field):
+            from .field import field_positions
+            t=self.a.frames[int(members[0])]
+            ra,dec=field_positions(field,t['mjd'])
+            sep=np.array([self._distance(x,y,t['expected_ra'],t['expected_dec']) for x,y in zip(ra,dec)])
+            near=np.isfinite(sep)&(sep<=(cfg.APERTURE_RADIUS_PIX+1)*cfg.PIXEL_ARCSEC)
+            if self.known: near &= sep>1.0
+            field_names={str(x) for x in field['name'][near]}
+
+        target=next((x for x in scores if x['role']=='target'),None)
+        alt=next((x for x in scores if x['role']=='alternative'),None)
+        if target: external=r('pass' if target['compatible'] else 'review','Independent spectrum compared at this observation.')
+        elif self.catalog_check is not None:
+            x=self.catalog_check; external=r('pass' if x['compatible'] else 'review',f'{len(x["rows"])} catalog filters; approximate whole-run comparison.')
+        else: external=r('unavailable','No usable independent spectrum for this target.')
+        better=bool(target and alt and alt['compatible'] and alt['score']+1<target['score'])
+        # Any nearby catalog source is a blending risk, not proof of a wrong identity.
+        # Broad-filter candidate scores must use the same filters. A nearby source is a
+        # possible contaminant even if its broadband spectrum does not fit particularly well.
+        better_catalog = None
+        if self.catalog_check is not None:
+            target_rows={round(x[1],2):x for x in self.catalog_check['rows']}
+            for candidate in self.competitors:
+                other=candidate['check']
+                if other is None: continue
+                other_rows={round(x[1],2):x for x in other['rows']}
+                shared=sorted(target_rows.keys() & other_rows.keys())
+                if len(shared)<3: continue
+                def mismatch(rows):
+                    return float(np.sqrt(np.mean([np.log(rows[k][4]/rows[k][2])**2 for k in shared])))
+                if other['compatible'] and mismatch(other_rows)+.25<mismatch(target_rows):
+                    better_catalog=candidate['name']; break
+        if better: alternatives=r('review',f'Alternative spectrum fits better: {alt["name"]}.')
+        elif better_catalog: alternatives=r('review',f'Nearby 2MASS source {better_catalog} fits better.')
+        elif self.competitors or (self.known and field_names): alternatives=r('review','Nearby catalog sources could blend with the target.')
+        elif field_names: alternatives=r('unavailable',f'{len(field_names)} nearby catalog entries; identity not assigned.')
+        elif scores and alt: alternatives=r('unavailable',f'Best library alternative: {alt["name"]}; identity not established.')
+        else: alternatives=r('unavailable','No competing spectrum verified.')
+        repeat=r('pass' if history['status']=='consistent' else 'review' if history['status']=='review' else 'unavailable',
+                 f'{history["matched"]} of {history["available"]} bands agree with earlier/later images.')
+        rows=[detection,position,self.motion,external,alternatives,repeat]
+        if detection['state']!='pass': title,tone='Source not independently confirmed','review' if detection['state']=='review' else 'unavailable'
+        elif position['state']=='review' or self.motion['state']=='review' or external['state']=='review' or better or better_catalog: title,tone='Possible mismatch — check the evidence','review'
+        elif alternatives['state']=='review' or repeat['state']=='review': title,tone='Source detected — worth checking','review'
+        elif not self.known: title,tone='Source detected — identity unknown','unavailable'
+        elif position['state']=='pass' and (external['state']=='pass' or (self.moving and self.motion['state']=='pass')):
+            title,tone='Evidence supports the target','pass'
+        else: title,tone='Source detected — identity uncertain','unavailable'
+        return dict(title=title,tone=tone,rows=rows,scores=scores)
+
+
 class BandViewer:
     """Linked target-centered stacks and the pipeline's unchanged tracking results.
 
@@ -422,7 +799,7 @@ class BandViewer:
     and the predicted/catalog center, never the detected brightness peak.
     """
     def __init__(self, analyzer, zooms, movement, tracked=None, size=41):
-        from matplotlib.widgets import Slider, RadioButtons, RangeSlider
+        from matplotlib.widgets import Slider, RadioButtons, RangeSlider, Button
         self.analyzer, self.zooms, self.movement = analyzer, zooms, movement
         self.name = (tracked or {}).get('name', 'SPHEREx target')
         self.n = len(analyzer.frames)
@@ -433,6 +810,14 @@ class BandViewer:
         if size < 3 or size % 2 != 1:
             raise ValueError('size must be odd and at least 3')
         self.size = size
+        self.pretty = bool(getattr(cfg, 'PRETTY_IMAGES', True))
+        if self.pretty:
+            from .visual import find_partners, anchors
+            self.partners = find_partners(zooms)
+            self.frame_anchors = anchors(zooms, self.partners)
+        else:
+            self.partners = [None] * self.n
+            self.frame_anchors = [None] * self.n
         self.detector = np.array([f['detector'] for f in analyzer.frames])
         if not np.isin(self.detector, np.arange(1, 7)).all():
             raise ValueError('SPHEREx detector IDs must be 1 through 6.')
@@ -441,6 +826,13 @@ class BandViewer:
             m = self.detector == d
             self.channels[m] = channel_index(d, analyzer.wavelength[m])
         self.days = analyzer.mjd - analyzer.mjd[0]
+        self.observations = analyzer.observation_groups()
+        self.n_obs = len(self.observations)
+        self.epoch_ids = np.empty(self.n, dtype=int)
+        for j, members in enumerate(self.observations):
+            self.epoch_ids[members] = j
+        self.observation = 0
+        self.obs_days = np.array([self.days[g[0]] for g in self.observations])
         self.good = (analyzer.reliable & np.isfinite(analyzer.flux) &
                      np.isfinite(analyzer.flux_err) & (analyzer.flux_err > 0))
         yy,xx = np.indices((size,size), dtype=float)
@@ -455,8 +847,10 @@ class BandViewer:
                        for key,idx in self.groups.items()}
         self.sed = analyzer.band_spectrum()
         self.time_mask = np.ones(self.n, bool)
-        self.key = (int(self.detector[0]), self._local_channel(0))
-        self.index = 0
+        self.verifier = ObjectVerification(analyzer, zooms, tracked, movement)
+        self.spec_ylim = self._compute_spectrum_ylim()
+        self.index = int(self.observations[0][0])
+        self.key = (int(self.detector[self.index]), self._local_channel(self.index))
         self._syncing = False
         self.gallery = plt.figure(figsize=(19,8.5))
         gs = self.gallery.add_gridspec(6,18,left=.045,right=.99,top=.88,bottom=.07,
@@ -471,8 +865,8 @@ class BandViewer:
             ax.imshow(snr,origin='lower',cmap=cmap,vmin=-3,vmax=12,interpolation='nearest')
             ax.set_xticks([]); ax.set_yticks([])
             title = 'All' if c == 0 else f'{CENTERS[d-1,c-1]:.3f}'
-            ax.set_title(f'{title}\nn={len(self.groups[key])}',fontsize=7)
-            if c == 0: ax.set_ylabel(f'D{d}',fontsize=10,weight='bold')
+            ax.set_title(f'{title}\nn={len(self.groups[key])}',fontsize=7,color=DETECTOR_COLORS[d-1])
+            if c == 0: ax.set_ylabel(f'D{d}',fontsize=10,weight='bold',color=DETECTOR_COLORS[d-1])
             if not np.any(n): ax.text(.5,.5,'—',ha='center',va='center',transform=ax.transAxes,color='white')
         covered = int(np.count_nonzero(self.sed['count']))
         self.gallery.suptitle(f'{self.name} | 102-channel atlas + six detector stacks\n'
@@ -480,28 +874,69 @@ class BandViewer:
                               'approximate target-wavelength bins; click any tile',fontsize=14)
         self.gallery.text(.5,.025,'All = broad detector stack  •  n = retained captures  •  '
                           'grayscale = approximate per-pixel S/N (−3 to +12)  •  — = no valid image pixels',ha='center',fontsize=10)
-        self.detail = plt.figure(figsize=(14,8.5))
-        grid = self.detail.add_gridspec(2,2,left=.075,right=.96,top=.83,bottom=.24,wspace=.31,hspace=.48)
-        self.ax_stack = self.detail.add_subplot(grid[0,0])
-        self.ax_native = self.detail.add_subplot(grid[0,1])
-        self.ax_spec = self.detail.add_subplot(grid[1,0])
-        self.ax_track = self.detail.add_subplot(grid[1,1])
-        self.slider = Slider(self.detail.add_axes([.16,.065,.57,.035]),'Capture T',1,max(2,self.n),valinit=1,valstep=1,valfmt='%d')
-        if self.n == 1: self.slider.set_active(False)
-        self.mode = RadioButtons(self.detail.add_axes([.79,.018,.18,.09]),['S/N','Brightness','Coverage'])
+        # One image, one spectrum. Original tracking graphs stay in their own windows.
+        self.image_view = 'original'
+        self.detail = plt.figure(figsize=(15,9.5), facecolor='white')
+        self.ax_image = self.detail.add_axes([.055,.32,.39,.405])
+        self.ax_spec = self.detail.add_axes([.54,.235,.415,.285])
+        self.header = self.detail.text(.055,.95,'',fontsize=18,weight='bold',va='top')
+        self.subtitle = self.detail.text(.055,.903,'',fontsize=10,color='#526174',va='top')
+        self.status_text = self.detail.text(.54,.895,'',fontsize=14,weight='bold',va='top')
+        self.reason_text = self.detail.text(.54,.565,'',fontsize=9,color='#475569',va='top')
+        self.verify_rows=[]
+        for j,label in enumerate(('Source detected','Expected position','Expected movement','External spectrum','Other possible objects','Repeat brightness')):
+            y=.850-j*.044
+            self.detail.text(.54,y,label,fontsize=10,weight='bold',va='top')
+            state=self.detail.text(.735,y,'',fontsize=10,weight='bold',va='top')
+            note=self.detail.text(.54,y-.019,'',fontsize=8.2,color='#475569',va='top')
+            self.verify_rows.append((state,note))
+        self.image_title = self.detail.text(.055,.842,'',fontsize=13,weight='bold',va='top')
+        self.image_note = self.detail.text(.055,.258,'',fontsize=9,color='#475569',va='top')
+        self.detail.text(.54,.177,'Small dots = other observations • Large dots = this observation\nBlack diamonds = independent reference (when available)',fontsize=8.5,color='#475569',va='top')
+        self.detail.text(.54,.147,'Repeat brightness is not proof of identity. Catalog checks use all dates.',
+                         fontsize=8.5,color='#64748b',va='top')
+        self.show_controls=False
+        self.control_button=Button(self.detail.add_axes([.055,.285,.19,.028]),'Show sky checks')
+        self.control_button.on_clicked(lambda _: self._toggle_controls())
+        self.detector_buttons = []
+        for d, color in enumerate(DETECTOR_COLORS, 1):
+            button = Button(self.detail.add_axes([.055 + (d-1)*.065,.735,.058,.027]), f'D{d}',
+                            color='#f1f5f9', hovercolor='#e2e8f0')
+            button.label.set_color(color)
+            button.label.set_fontsize(9)
+            button.on_clicked(lambda _, det=d: self.select_detector(det))
+            self.detector_buttons.append(button)
+        self.original_button = Button(self.detail.add_axes([.055,.765,.18,.047]),'This image')
+        self.stack_button = Button(self.detail.add_axes([.245,.765,.20,.047]),'Combined view')
+        self.original_button.on_clicked(lambda _: self.set_view('original'))
+        self.stack_button.on_clicked(lambda _: self.set_view('stack'))
+        self.mode = RadioButtons(self.detail.add_axes([.055,.135,.19,.087]),['Clear view','Brightness','Support'])
+        self.mode.on_clicked(lambda _: self.set_view('stack'))
+        self.mode_label = self.detail.text(.26,.18,'Combined image options\nClear view = visibility above noise',fontsize=8,color='#64748b',va='center')
+        self.slider = Slider(self.detail.add_axes([.23,.074,.56,.032]),'Observation',1,max(2,self.n_obs),valinit=1,valstep=1,valfmt='%d')
+        if self.n_obs == 1: self.slider.set_active(False)
+        self.prev_button = Button(self.detail.add_axes([.055,.064,.075,.045]),'← Prev')
+        self.next_button = Button(self.detail.add_axes([.875,.064,.08,.045]),'Next →')
+        self.prev_button.on_clicked(lambda _: self._step(-1))
+        self.next_button.on_clicked(lambda _: self._step(1))
         self.time_slider = None
-        if np.ptp(self.days) > 0:
-            self.time_slider = RangeSlider(self.detail.add_axes([.16,.135,.57,.025]),
-                                           'Spectrum days',float(self.days.min()),float(self.days.max()),
-                                           valinit=(float(self.days.min()),float(self.days.max())),valfmt='%.2f')
+        if np.isfinite(self.obs_days).all() and np.ptp(self.obs_days) > 0:
+            self.time_slider = RangeSlider(self.detail.add_axes([.66,.112,.21,.018]),
+                                           'Compare days',float(self.obs_days.min()),float(self.obs_days.max()),
+                                           valinit=(float(self.obs_days.min()),float(self.obs_days.max())),valfmt='%.1f')
             self.time_slider.on_changed(self._on_time)
+        self.detail.text(.055,.02,'← / → browse observation times   •   D1–D6 switch images   •   Click the separate gallery to explore a channel',
+                         fontsize=9,color='#64748b')
         self.slider.on_changed(self._on_slider)
-        self.mode.on_clicked(lambda _: self._redraw())
         self.gallery.canvas.mpl_connect('button_press_event',self._on_tile)
         self.detail.canvas.mpl_connect('key_press_event',self._on_key)
-        self.detail.canvas.mpl_connect('pick_event',self._on_pick)
         # Matplotlib keeps weak refs to bound callbacks; keep the viewer alive.
         self.gallery._band_viewer = self.detail._band_viewer = self
+        self._redraw()
+
+    def _toggle_controls(self):
+        self.show_controls=not self.show_controls
+        self.control_button.label.set_text('Hide sky checks' if self.show_controls else 'Show sky checks')
         self._redraw()
 
     def _local_channel(self,i):
@@ -521,114 +956,293 @@ class BandViewer:
         key=(int(detector),int(channel))
         if key not in self.groups: raise ValueError('detector 1–6, channel 0–17')
         self.key=key
+        self.image_view = 'stack'
         idx=self.groups[key]
         if len(idx):
             # Keep the current frame if it belongs to the chosen group; otherwise
             # select the closest time to the previous frame.
             closest=idx[np.argmin(np.abs(self.days[idx]-self.days[self.index]))]
             if self.index not in idx: self.index=int(closest)
+            self.observation = int(self.epoch_ids[self.index])
             self._syncing=True
-            try: self.slider.set_val(self.index+1)
+            try: self.slider.set_val(self.observation+1)
             finally: self._syncing=False
         self._redraw()
 
     def _on_time(self, bounds):
         lo, hi = bounds
-        self.time_mask = (self.days >= lo) & (self.days <= hi)
+        keep = (self.obs_days >= lo) & (self.obs_days <= hi)
+        self.time_mask = keep[self.epoch_ids]
         self.sed = self.analyzer.band_spectrum(self.time_mask)
         self._redraw()
 
     def _on_slider(self,value):
         if self._syncing: return
-        self.index=min(self.n-1,max(0,int(value)-1))
-        # Chronological browsing follows the actual detector and wavelength.
+        preferred = int(self.detector[self.index])
+        self.observation = min(self.n_obs-1,max(0,int(value)-1))
+        members = self.observations[self.observation]
+        same = members[self.detector[members] == preferred]
+        self.index = self._representative(same if len(same) else members)
+        self.image_view = 'original'
         self.key=(int(self.detector[self.index]),self._local_channel(self.index))
         self._redraw()
 
+    def _representative(self, members):
+        """Pick a usable image for display only; no measurements discarded."""
+        if self.index in members:
+            return int(self.index)
+        usable = members[self.good[members]]
+        return int(usable[0] if len(usable) else members[0])
+
+    def select_detector(self, detector):
+        """Change the displayed image without changing the observation spectrum."""
+        members = self.observations[self.observation]
+        same = members[self.detector[members] == detector]
+        if not len(same):
+            return
+        self.index = self._representative(same)
+        self.key = (int(detector), self._local_channel(self.index))
+        self.image_view = 'original'
+        self._redraw()
+
+    def set_view(self, view):
+        """Switch the single image panel without changing the selected capture."""
+        if view not in ('original', 'stack'):
+            raise ValueError('view must be original or stack')
+        self.image_view = view
+        self._redraw()
+
+    def _step(self, direction):
+        self.slider.set_val(np.clip(self.observation+1+direction,1,self.n_obs))
+
     def _on_key(self,event):
         if event.key in ('left','right'):
-            self.slider.set_val(np.clip(self.index+1+(1 if event.key=='right' else -1),1,self.n))
+            self._step(1 if event.key=='right' else -1)
 
-    def _on_pick(self,event):
-        idx=getattr(event.artist,'_frame_indices',None)
-        if idx is not None and len(event.ind):
-            self.slider.set_val(int(idx[event.ind[0]])+1)
+    def _compute_spectrum_ylim(self):
+        """Fixed scale including all finite measurements and their error bars.
+
+        Weighted reference averages lie within the finite measurement range.
+        No percentile clipping: an unusual observation must stay visible.
+        """
+        f, e = self.analyzer.flux, self.analyzer.flux_err
+        ok = np.isfinite(f)
+        good = ok & np.isfinite(e) & (e > 0)
+        values = np.r_[f[ok], f[good]-e[good], f[good]+e[good]]
+        if self.verifier.catalog_check is not None:
+            values=np.r_[values,[(f-e) for _,w,f,e,m in self.verifier.catalog_check['rows']],[(f+e) for _,w,f,e,m in self.verifier.catalog_check['rows']]]
+        for t in self.verifier.templates:
+            if t['role']=='target' and t['name'].casefold()==self.name.casefold():
+                p=t['points']; in_range=(p[:,0]>=.7)&(p[:,0]<=5.05)
+                values=np.r_[values,p[in_range,1]-p[in_range,2],p[in_range,1]+p[in_range,2]]
+        values = values[np.isfinite(values)]
+        if not len(values):
+            return (0., 1.)
+        lo, hi = float(values.min()), float(values.max())
+        pad = .10 * (hi-lo if hi > lo else max(abs(hi), 1.))
+        return lo-pad, hi+pad
+
+    def _show_pretty_stack(self, ax, data, mode, lim):
+        """Sharpened display-only rendering for combined stacks."""
+        from .visual import upsample
+        finite = data[np.isfinite(data)]
+        fill = float(np.nanmedian(finite)) if finite.size else 0.0
+        filled = np.where(np.isfinite(data), data, fill)
+        factor = max(1, int(getattr(cfg, 'DISPLAY_UPSCALE', 1)))
+        big = upsample(filled, factor, sharp=True) if factor > 1 else filled
+        extent = (-0.5, data.shape[1] - 0.5, -0.5, data.shape[0] - 0.5)
+        cmap = 'viridis' if mode == 'Coverage' else 'gray'
+        ax.imshow(big, origin='lower', cmap=cmap, vmin=lim[0], vmax=lim[1],
+                  extent=extent, interpolation='nearest')
+        if not finite.size:
+            ax.text(.5, .5, 'No usable image pixels', transform=ax.transAxes,
+                    ha='center', va='center', color='white',
+                    bbox=dict(facecolor='#333333'))
+
+    def _band_label(self, detector, channel):
+        if channel == 0:
+            return f'Band {detector} · all wavelengths'
+        return f'Band {detector} · {CENTERS[detector-1,channel-1]:.3f} µm'
+
+    def _draw_spectrum(self, active):
+        """One observation, all available detectors, one independent reference."""
+        from matplotlib.lines import Line2D
+        ax, a = self.ax_spec, self.analyzer
+        ax.clear()
+        ax.set(xlim=(.7, 5.05), ylim=self.spec_ylim,
+               xlabel='Infrared wavelength (µm)', ylabel='Brightness (mJy)')
+        ax.set_xticks([1,2,3,4,5])
+        ax.tick_params(labelsize=9)
+        ax.grid(axis='y', alpha=.15)
+        ax.spines[['top','right']].set_visible(False)
+        handles = [Line2D([],[],marker='o',linestyle='none',markersize=5,
+                          color=color,label=f'D{d}') for d,color in enumerate(DETECTOR_COLORS,1)]
+        ax.legend(handles=handles,loc='lower left',bbox_to_anchor=(0,1.025,1,.04),
+                  ncol=6,mode='expand',borderaxespad=0,frameon=False,
+                  fontsize=9,handletextpad=.15,columnspacing=.6)
+        members = self.observations[self.observation] if active else np.array([], dtype=int)
+        # Remove the entire exposure group, including slight timestamp offsets.
+        mask = self.time_mask.copy()
+        mask[members] = False
+        if active:
+            mask = a.reference_mask(self.index, mask)
+        else:
+            align = np.array([f.get('alignment_px', np.nan) for f in a.frames], float)
+            mask &= np.isfinite(a.mjd) & ~(np.isfinite(align) & (align > cfg.ALIGNMENT_TOLERANCE_PIX))
+        reference = self.reference_sed = a.band_spectrum(mask)
+        valid = reference['count'] > 0
+        self.detector_checks = {}
+        for d,color in enumerate(DETECTOR_COLORS,1):
+            keep = valid & (np.arange(102)//17 == d-1)
+            # Connect only consecutive populated wavelength channels, within a detector.
+            y = np.where(keep, reference['flux_mjy'], np.nan)
+            ax.plot(reference['wavelength_um'], y, color=color, alpha=.45,
+                    lw=1.25, marker='o',markersize=3.8,zorder=2)
+            checks = []
+            for i in members[self.detector[members] == d]:
+                check = a.capture_consistency(int(i), mask, epoch_ids=self.epoch_ids)
+                checks.append(check)
+                w,f,e = a.wavelength[i],a.flux[i],a.flux_err[i]
+                if np.isfinite(w) and np.isfinite(f):
+                    if np.isfinite(e) and e > 0:
+                        ax.errorbar(w,f,yerr=e,fmt='none',color=color,alpha=.7,lw=1,capsize=2,zorder=3)
+                    # Hollow marker for suspect measurements, rather than hiding them.
+                    ax.scatter([w],[f],s=95,facecolor='white' if check['status']=='quality' else color,
+                               edgecolor='#172033',linewidth=1.3,zorder=5)
+                    if check['status']=='quality':
+                        ax.scatter([w],[f],s=25,marker='x',color=color,zorder=6)
+            if checks:
+                # A discrepancy must not disappear in an average of detector checks.
+                rank = {'consistent':0,'insufficient':1,'quality':2,'review':3}
+                self.detector_checks[d] = max(checks,key=lambda c: rank[c['status']])
+        statuses = {d:c['status'] for d,c in self.detector_checks.items()}
+        matched = [d for d,v in statuses.items() if v=='consistent']
+        review = [d for d,v in statuses.items() if v=='review']
+        quality = [d for d,v in statuses.items() if v=='quality']
+        total = len(statuses)
+        if not active:
+            status,title,reason = 'insufficient','Select an observation','This channel has no retained images.'
+        elif review:
+            status,title = 'review','Worth another look'
+            reason = 'Brightness differs in '+', '.join(f'D{d}' for d in review)+f'. {len(matched)} of {total} available bands agree.'
+        elif total and len(matched)==total:
+            status,title = 'consistent','Brightness looks consistent'
+            reason = f'All {total} available bands agree with comparable observations.'
+            if total == 1: reason += ' Only one band was captured.'
+        elif matched:
+            status,title = 'insufficient','Partial agreement'
+            reason = f'{len(matched)} of {total} available bands agree; the others cannot be checked confidently.'
+        elif quality:
+            status,title,reason = 'quality','Check image quality','No band could confirm agreement; some measurements have quality issues.'
+        else:
+            status,title,reason = 'insufficient','Not enough information','No available band has enough reliable comparable measurements.'
+        self.check = dict(status=status,title=title,reason=reason,matched=len(matched),available=total)
+        self.status_text.set_text('Quick check · '+title)
+        self.status_text.set_color({'consistent':'#23744e','review':'#a35320','quality':'#a35320','insufficient':'#526174'}[status])
+        self.reason_text.set_text('Spectrum history · '+title)
+        self.verification = self.verifier.evaluate(members, self.check)
+        self.status_text.set_text(self.verification['title'])
+        palette={'pass':'#23744e','review':'#a35320','unavailable':'#526174'}
+        self.status_text.set_color(palette[self.verification['tone']])
+        for (state,note),row in zip(self.verify_rows,self.verification['rows']):
+            state.set_text({'pass':'Supports','review':'Check','unavailable':'Not confirmed'}[row['state']])
+            state.set_color(palette[row['state']]); note.set_text(row['note'][:105])
+        target_ref=next((t for t in self.verification.get('scores',[]) if t['role']=='target'),None)
+        if target_ref is not None:
+            ax.errorbar(target_ref['wavelength'],target_ref['flux'],yerr=target_ref['error'],fmt='D',color='#222222',markersize=4,capsize=2,zorder=7)
+        elif self.verifier.catalog_check is not None:
+            for name,w,f,e,_ in self.verifier.catalog_check['rows']:
+                ax.errorbar(w,f,yerr=e,fmt='D',color='#222222',markersize=4,capsize=2,zorder=7)
+        if not valid.any():
+            ax.text(.03,.05,'No usable reference points in these days.',transform=ax.transAxes,fontsize=8,color='#64748b')
+        elif active and not any(np.isfinite(a.flux[members]) & np.isfinite(a.wavelength[members])):
+            ax.text(.03,.05,'No measurable brightness in this observation.',transform=ax.transAxes,fontsize=8,color='#64748b')
 
     def _redraw(self):
-        from .plots import draw_zoom, circle_legend
+        from .plots import draw_zoom
         a=self.analyzer; d,c=self.key; idx=self.groups[self.key]
+        color=DETECTOR_COLORS[d-1]
         for ax,key in self.tiles.items():
             for spine in ax.spines.values():
-                spine.set_color('#e39b36' if key==self.key else '#666666')
-                spine.set_linewidth(2.2 if key==self.key else .4)
+                spine.set_color('#172033' if key==self.key else DETECTOR_COLORS[key[0]-1])
+                spine.set_linewidth(2.6 if key==self.key else .8)
         self.gallery.canvas.draw_idle()
-        ax=self.ax_stack; ax.clear()
-        mean,var,n=self.stacks[self.key]
-        mode=self.mode.value_selected
-        data=mean/np.sqrt(var) if mode=='S/N' else mean if mode=='Brightness' else np.where(n>0,n,np.nan)
-        finite=data[np.isfinite(data)]
-        lim=(-3,12) if mode=='S/N' else ((0,max(1,int(n.max()))) if mode=='Coverage' else
-             ((float(np.percentile(finite,2)),float(np.percentile(finite,99))) if finite.size else (0,1)))
-        if lim[1]<=lim[0]: lim=(lim[0],lim[0]+1)
-        ax.imshow(data,origin='lower',cmap='gray' if mode!='Coverage' else 'viridis',
-                  vmin=lim[0],vmax=lim[1],interpolation='nearest')
-        center=self.size//2
-        ax.add_patch(Circle((center,center),cfg.APERTURE_RADIUS_PIX,fill=False,ls='--',color='deepskyblue'))
-        label='all wavelengths' if c==0 else f'C{c:02d} ≈ {CENTERS[d-1,c-1]:.3f} µm'
-        ax.set_title(f'D{d} | {label}\n{len(idx)} captures · {mode} · center coverage {n[center,center]}',fontsize=10)
-        ax.set(xlabel='Target-relative x (east ←)',ylabel='Target-relative y (north ↑)')
-        if not np.any(n): ax.text(.5,.5,'No valid image pixels',transform=ax.transAxes,ha='center',color='white',bbox=dict(facecolor='#333333'))
-        ax=self.ax_native; ax.clear()
+        ax=self.ax_image; ax.clear(); ax.set_axis_on()
         active=len(idx)>0 and self.index in idx
-        if active:
-            draw_zoom(ax,self.zooms[self.index],self.index,self.n,a.mjd[0],self.movement,a.brightness)
-            ax.set(xlabel='Original cutout x (px)',ylabel='Original cutout y (px)')
-            ax.legend(handles=circle_legend(self.movement),loc='lower left',fontsize=7)
+        stack=self.image_view=='stack'
+        for button,selected in ((self.original_button,not stack),(self.stack_button,stack)):
+            button.color='#dbe5f0' if selected else '#f1f5f9'
+            button.ax.set_facecolor(button.color)
+            button.label.set_fontweight('bold' if selected else 'normal')
+        self.mode.ax.set_visible(stack); self.mode_label.set_visible(stack)
+        self.control_button.ax.set_visible(not stack and active)
+        label = self._band_label(d, c)
+        self.header.set_text(self.name)
+        members = self.observations[self.observation] if active else np.array([],dtype=int)
+        present = set(self.detector[members])
+        self.subtitle.set_text((f'Observation {self.observation+1} of {self.n_obs}  |  '
+                                f'{len(present)}/6 detector bands available  |  {label}')
+                               if active else f'{label}  |  No observation in this channel')
+        for det, button in enumerate(self.detector_buttons,1):
+            available = det in present
+            selected = available and det == self.detector[self.index] and not stack
+            button.set_active(available)
+            button.color = '#dbe5f0' if selected else '#f1f5f9'
+            button.ax.set_facecolor(button.color)
+            button.label.set_color(DETECTOR_COLORS[det-1] if available else '#aab2bf')
+            button.label.set_fontweight('bold' if selected else 'normal')
+        self.subtitle.set_color(color)
+        if stack:
+            mean,var,n=self.stacks[self.key]
+            mode=self.mode.value_selected
+            display_mode = 'S/N' if mode == 'Clear view' else 'Brightness' if mode == 'Brightness' else 'Coverage'
+            data=mean/np.sqrt(var) if display_mode=='S/N' else mean if display_mode=='Brightness' else np.where(n>0,n,np.nan)
+            finite=data[np.isfinite(data)]
+            lim=(-3,12) if display_mode=='S/N' else ((0,max(1,int(n.max()))) if display_mode=='Coverage' else
+                 ((float(np.percentile(finite,2)),float(np.percentile(finite,99))) if finite.size else (0,1)))
+            if lim[1]<=lim[0]: lim=(lim[0],lim[0]+1)
+            if self.pretty:
+                self._show_pretty_stack(ax, data, display_mode, lim)
+            else:
+                ax.imshow(data,origin='lower',cmap='gray' if display_mode!='Coverage' else 'viridis',
+                          vmin=lim[0],vmax=lim[1],interpolation='nearest')
+            center=self.size//2
+            ax.add_patch(Circle((center,center),cfg.APERTURE_RADIUS_PIX,fill=False,ls='--',color='deepskyblue'))
+            self.image_title.set_text(f'Combined image · {len(idx)} observations')
+            self.image_note.set_text('Blue circle = expected position; images aligned to that position.\n'
+                                     'Spectrum compares all bands from the selected observation.\n'
+                                     'Combined image uses all dates.')
+            if not np.any(n):
+                ax.text(.5,.5,'No usable image pixels',transform=ax.transAxes,ha='center',color='white',bbox=dict(facecolor='#333333'))
+        elif active:
+            # find_partners() returns indices (or None), but draw_zoom/render
+            # expects the matching zoom dictionary, including its pixels and WCS.
+            partner_idx = self.partners[self.index]
+            partner = self.zooms[partner_idx] if partner_idx is not None else None
+            draw_zoom(ax, self.zooms[self.index], self.index, self.n, a.mjd[0], self.movement,
+                      a.brightness, compact=True, pretty=self.pretty,
+                      partner=partner, anchor=self.frame_anchors[self.index])
+            ax.set_title('')
+            i=self.index
+            if self.show_controls:
+                for x,y in self.verifier.background(i)['positions']:
+                    ax.add_patch(Circle((x,y),cfg.APERTURE_RADIUS_PIX,fill=False,ls=':',lw=1,color='#47d7ee'))
+            self.image_title.set_text(f'D{self.detector[i]} image · {self.zooms[i]["date_obs"][:16].replace("T", " ")}')
+            detected=bool(self.movement.get('detected',np.ones(self.n,bool))[i])
+            flagged=bool(self.movement['flagged'][i])
+            if not detected or not a.reliable[i]: tracking='Tracking: low confidence in this observation.'
+            elif flagged: tracking='Tracking: position flagged by the existing analysis.'
+            else: tracking='Tracking: no movement warning from the existing analysis.'
+            ref='expected position' if self.verifier.moving else 'first observed position'
+            self.image_note.set_text(f'Red circle = measured position; blue = {ref}.\n'+tracking+('\nDotted cyan circles = nearby sky checks.' if self.show_controls else '')+('\nEnhanced colours and brightness are for display only.' if self.pretty else ''))
         else:
-            ax.text(.5,.5,'No retained captures in this channel',ha='center',va='center',transform=ax.transAxes)
-            ax.set_axis_off()
-        if active: ax.set_axis_on()
-        ax=self.ax_spec; ax.clear()
-        colors=plt.get_cmap('tab10')
-        for det in range(1,7):
-            m=(self.detector==det)&self.good&self.time_mask
-            if m.any():
-                ax.errorbar(a.wavelength[m],a.flux[m],yerr=a.flux_err[m],fmt='.',ms=4,alpha=.38,color=colors(det-1))
-            sl=slice((det-1)*17,det*17); s=self.sed
-            ok=s['count'][sl]>0
-            ax.errorbar(s['wavelength_um'][sl][ok],s['flux_mjy'][sl][ok],yerr=s['flux_err_mjy'][sl][ok],
-                        fmt='o',ms=4,color=colors(det-1),label=f'D{det}')
-        bad=(~self.good)&self.time_mask&np.isfinite(a.wavelength)&np.isfinite(a.flux)
-        if bad.any(): ax.scatter(a.wavelength[bad],a.flux[bad],marker='x',color='0.5',s=10,label='Excluded')
-        if c: ax.axvline(CENTERS[d-1,c-1],color='#e39b36',ls='--',lw=1)
-        else: ax.axvspan(*LIMITS[d-1],color='#e39b36',alpha=.12)
-        if active and self.time_mask[self.index]: ax.scatter(a.wavelength[self.index],a.flux[self.index],s=100,facecolors='none',edgecolors='red',zorder=5)
-        ax.set(xlim=(.7,5.05),xlabel='Wavelength (µm)',ylabel='Aperture flux density (mJy)',
-               title=f'Live spectrum | {np.count_nonzero(self.sed["count"])}/102 channels in time window')
-        ax.legend(ncol=3,fontsize=7,loc='best'); ax.grid(alpha=.18)
-        ax=self.ax_track; ax.clear()
-        moving='residual_arcsec' in self.movement
-        values=np.asarray(self.movement['residual_arcsec' if moving else 'offset_arcsec'])
-        detected=np.asarray(self.movement.get('detected',np.ones(self.n,bool)),bool) & self.good
-        flags=np.asarray(self.movement['flagged'],bool)
-        for det in range(1,7):
-            for ok,marker in [(True,'o'),(False,'x')]:
-                keep=(self.detector==det)&(detected==ok)&np.isfinite(values)
-                indices=np.flatnonzero(keep)
-                if len(indices):
-                    dots=ax.scatter(self.days[indices],values[indices],s=15,marker=marker,color=colors(det-1),alpha=.65,picker=5)
-                    dots._frame_indices=indices
-        if len(idx): ax.scatter(self.days[idx],values[idx],s=42,facecolors='none',edgecolors='#e39b36',label='Selected band')
-        if flags.any(): ax.scatter(self.days[flags],values[flags],s=85,facecolors='none',edgecolors='red',label='Tracking flag')
-        if active:
-            ax.axvline(self.days[self.index],color='0.4',ls=':',lw=1)
-            ax.scatter(self.days[self.index],values[self.index],marker='s',s=105,facecolors='none',edgecolors='black',label=f'T{self.index+1}')
-        ax.set(xlabel='Days since T1',ylabel='Ephemeris residual (arcsec)' if moving else 'Offset from T1 (arcsec)',
-               title='Existing tracking | click capture (× = low confidence)')
-        ax.grid(alpha=.18)
-        if ax.get_legend_handles_labels()[0]: ax.legend(fontsize=7,loc='best')
-        self.detail.suptitle(f'{self.name} | D{d} {label}\n'
-                             'Stacks and tracking: all captures • spectrum: selected days',fontsize=13)
+            self.image_title.set_text('This image')
+            self.image_note.set_text('Choose a band with an observation, or browse with Prev / Next.')
+            ax.text(.5,.5,'No observation available',ha='center',va='center',transform=ax.transAxes)
+        # Hide native pixel coordinates in the beginner-facing view. They remain
+        # available in the original tracking windows and unmodified zoom arrays.
+        ax.set_xticks([]); ax.set_yticks([])
+        self._draw_spectrum(active)
         self.detail.canvas.draw_idle()
 
 
@@ -637,10 +1251,13 @@ def launch(show_original=True, show_fit=False, **run_kwargs):
     from .main import run
     from .plots import show_viewer, show_motion, show_time_series, show_spectrum
     run_kwargs.pop('show',None)
-    results=run(show=False,**run_kwargs)
+    results = run(show=False, **run_kwargs)
+    # main.run() returns measurements, not an initialized SpectrumAnalyzer.
+    # Construct it here; do not look up a possibly missing results['analyzer'].
     analyzer = SpectrumAnalyzer.from_results(results)
     results['analyzer'] = analyzer
-    results['band_viewer'] = analyzer.show_bands()
+    viewer = analyzer.show_bands()
+    results['band_viewer'] = viewer
     if show_original:
         frames,tracked,movement=results['frames'],results['tracked'],results['movement']
         brightness=results.get('brightness')
@@ -648,7 +1265,11 @@ def launch(show_original=True, show_fit=False, **run_kwargs):
         if brightness is None: show_motion(frames,tracked,movement)
         else:
             show_time_series(frames,tracked,movement,brightness)
-            show_spectrum(results['spectrum'],tracked)
+            spectrum = results.get('spectrum')
+            if spectrum is not None:
+                show_spectrum(spectrum, tracked)
+            else:
+                print('Catalog spectrum unavailable; interactive SPHEREx comparison remains available.')
     if show_fit:
         results['motion_fit'] = analyzer.motion_fit()
     plt.show()
