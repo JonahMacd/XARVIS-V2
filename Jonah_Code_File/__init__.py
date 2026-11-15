@@ -1,7 +1,7 @@
 """SPHEREx transient analysis: every SPHEREx image of a moving asteroid (or a star), T1 ... Tn in time order.
 
 Modules
-  config.py   all settings (which asteroid or star, time window, ...)
+  config.json all settings (which asteroid or star, time window, ...)
   irsa.py     talking to IRSA: timeouts, retries, image search, catalogs, cutouts
   cache.py    disk cache of downloads (fast re-runs), cleaned up automatically after every run
   results.py  save / load each run's measurements as a small table (results/<target>.ecsv)

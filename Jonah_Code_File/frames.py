@@ -99,7 +99,7 @@ def load_frame(row, coord=None, moving=None):
                              object_err_arcsec=float(np.hypot(fit[2], fit[3]) * cfg.PIXEL_ARCSEC),
                              track=track, track_sep_px=separation,
                              glow=glow_brightness(frame, fit[0], fit[1]))   # RELATIVE brightness only
-        if moving and frame['object_found']:    # SPHEREx's own sign of a moving source (see config.py)
+        if moving and frame['object_found']:    # SPHEREx's own sign of a moving source
             x, y = frame['catalog_xy']
             yy, xx = np.indices(frame['flags'].shape)
             near = np.hypot(xx - x, yy - y) <= cfg.APERTURE_RADIUS_PIX

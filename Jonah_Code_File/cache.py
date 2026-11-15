@@ -5,7 +5,7 @@ and IRSA's image-search replies, compressed. Where: a local folder that OneDrive
 (%LOCALAPPDATA%\\Jonah_Code_File\\cache on Windows). Clean-up, after every run (even one that crashes):
   - anything not used for CACHE_MAX_AGE_DAYS is deleted,
   - then the least recently used files are deleted until the cache is under CACHE_MAX_MB.
-Set CACHE_ENABLED = False in config.py to never write anything; clear_cache() deletes it all.
+Set CACHE_ENABLED to false in config.json to never write anything; clear_cache() deletes it all.
 """
 
 import hashlib

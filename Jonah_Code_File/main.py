@@ -1,4 +1,4 @@
-"""Run the whole analysis: run __main__.py, or python -m Jonah_Code_File (settings: config.py; or the command
+"""Run the whole analysis: run __main__.py, or python -m Jonah_Code_File (settings: config.json; or the command
 line - python -m Jonah_Code_File --help)."""
 
 import argparse
@@ -73,7 +73,7 @@ def run(ra_deg=cfg.RA_DEG, dec_deg=cfg.DEC_DEG, max_images=cfg.MAX_IMAGES, show=
     each frame's full-size cutout arrays are released as its zoom is cut (results['frames'] then hold
     measurements only, and results['zooms'] hold the pixels). False keeps both.
 
-    A target passed here (asteroid / star / coords) replaces config.py's; with none, config.py decides."""
+    A target passed here (asteroid / star / coords) replaces config.json's; with none, config.json decides."""
     if asteroid is None and star is None and coords is None:
         asteroid, star, coords = cfg.ASTEROID, cfg.STAR, cfg.COORDS
     if asteroid:
@@ -248,7 +248,7 @@ def run_moving(tracked, settings, max_images=cfg.MAX_IMAGES, show=True, zoom_onl
     try:
         images = find_images(tracked, spacing_deg)             # the SPHEREx images that caught it
         if not len(images):
-            raise RuntimeError('No SPHEREx image caught the asteroid in this window - try another window (config.py)')
+            raise RuntimeError('No SPHEREx image caught the asteroid in this window - try another window (config.json)')
         if max_images:
             images = images[:max_images]
         images = add_predicted_positions(images, tracked)      # its exact position, as seen from SPHEREx
@@ -381,16 +381,16 @@ def interactive(max_images=None):
 
 def cli(argv=None):
     """Command line: python -m Jonah_Code_File [--coords "RA Dec" | --star NAME | --asteroid ID] ...
-    With no options: the start window (pick a known object, or enter coordinates). --config: config.py's target."""
+    With no options: the start window (pick a known object, or enter coordinates). --config: config.json's target."""
     parser = argparse.ArgumentParser(prog='python -m Jonah_Code_File',
-                                     description='SPHEREx transient / moving-object analysis (settings: config.py)')
+                                     description='SPHEREx transient / moving-object analysis (settings: config.json)')
     target = parser.add_mutually_exclusive_group()
     target.add_argument('--coords', help='point at exactly this sky position, e.g. "08h55m10.8s -07d14m42s" or "133.795 -7.245"')
     target.add_argument('--star', help="a star or brown dwarf by name (SIMBAD), e.g. \"Barnard's Star\"")
     target.add_argument('--asteroid', help="an asteroid or comet (JPL Horizons id), e.g. 433")
     parser.add_argument('--window', nargs=2, metavar=('START', 'END'), help='asteroid search window, e.g. 2026-02-15 2026-06-15')
     parser.add_argument('--max-images', type=int, help='only the first N images (quick test)')
-    target.add_argument('--config', action='store_true', help="the target set in config.py (no start window)")
+    target.add_argument('--config', action='store_true', help="the target set in config.json (no start window)")
     parser.add_argument('--no-show', action='store_true', help="don't open any windows (results are still saved)")
     args = parser.parse_args(argv)
 
@@ -398,7 +398,7 @@ def cli(argv=None):
         return interactive(args.max_images)
     options = dict(max_images=args.max_images if args.max_images else cfg.MAX_IMAGES, show=not args.no_show,
                    window=tuple(args.window) if args.window else cfg.ASTEROID_WINDOW)
-    results = run(asteroid=args.asteroid, star=args.star, coords=args.coords, **options)   # none given: config.py's
+    results = run(asteroid=args.asteroid, star=args.star, coords=args.coords, **options)   # none given: config.json's
     if not args.no_show:                                    # an object picked in the viewer (T): track it next
         from .plots import take_track_request
         spec = take_track_request()
