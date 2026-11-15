@@ -80,6 +80,14 @@ SB_IDENT_VMAG_LIMIT = 21            # JPL SB Ident: known asteroids/comets down 
 SB_IDENT_MAX_CALLS = 4              # look up at most this many unexplained sources per run (~20 s each, in parallel)
 SB_IDENT_MATCH_ARCSEC = 15          # a known object this close to an unexplained source explains it
 
+## sky map (skymap.py): name every object in the image, find the new ones. Always done for coordinates.
+SKYMAP_FOR_ALL_TARGETS = False      # True: also for named stars / snapped stars (adds ~1-4 min of JPL lookups)
+SKYMAP_MAX_SB_CALLS = 1             # JPL SB Ident lookups per run (~20 s each): one, for the burst of observations with
+                                    # the most unexplained detections; if it finds nothing, move on. J in the viewer
+                                    # checks any other frame. (JPL allows 20 per 5 minutes.)
+SKYMAP_BURST_DAYS = 3.0             # one lookup covers observations up to this many days apart (bodies' rates do the rest)
+SKYMAP_MAX_RATE_DEG_PER_DAY = 1.0   # asteroid search widened by this motion; new movers linked up to 4x this
+
 ## bad pixels (ignored in all measurements)
 # SPHEREx FLAGS that make a pixel unreliable. Not included: SOURCE ("a known star is here"), FULLSAMPLE,
 # DICHROIC, PHANMISS, and HALO (it marks the surroundings of ordinary stars too, so it isn't a defect).

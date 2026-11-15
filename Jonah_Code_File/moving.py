@@ -33,6 +33,16 @@ class Ephemeris:
         self.ra = np.unwrap(np.radians(np.array(table['RA'], dtype=float)))     # unwrapped across 360 -> 0
         self.dec = np.array(table['DEC'], dtype=float)
 
+    @classmethod
+    def from_arrays(cls, mjd, ra_deg, dec_deg):
+        """A path given directly (e.g. fitted to an unknown moving object's detections) instead of from Horizons."""
+        self = cls.__new__(cls)
+        self.table = None
+        self.mjd = np.asarray(mjd, dtype=float)
+        self.ra = np.unwrap(np.radians(np.asarray(ra_deg, dtype=float)))
+        self.dec = np.asarray(dec_deg, dtype=float)
+        return self
+
     def position(self, mjd):
         """(RA, Dec) in degrees at the given time(s) (MJD)."""
         return np.degrees(np.interp(mjd, self.mjd, self.ra)) % 360, np.interp(mjd, self.mjd, self.dec)
@@ -116,7 +126,11 @@ def find_images(tracked, spacing_deg=cfg.GRID_SPACING_DEG):
 
 def add_predicted_positions(images, tracked):
     """Where the asteroid was at each exposure, as seen from the SPHEREx spacecraft: adds columns
-    'target_ra' / 'target_dec' (degrees) to `images`."""
+    'target_ra' / 'target_dec' (degrees) to `images`. An object without a Horizons orbit (a path fitted to new
+    detections, tracked['asteroid'] = None) uses its own path instead."""
+    if not tracked.get('asteroid'):
+        images['target_ra'], images['target_dec'] = tracked['ephemeris'].position(np.array(images['t_mid'], dtype=float))
+        return images
     epochs, back = np.unique(np.round(np.array(images['t_mid'], dtype=float), 6), return_inverse=True)
     ra, dec = [], []
     for start in range(0, len(epochs), EPOCHS_PER_REQUEST):

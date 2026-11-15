@@ -20,7 +20,6 @@ from .plots import LiveView, show_motion, show_spectrum, show_time_series, show_
 from .results import save_results
 from .stars import catalog_sed, contamination_check, position_at, positions_at, resolve_star
 from .target import find_tracked_object
-<<<<<<< HEAD
 
 MID_DATA_MJD = 61000.0          # ~2025-11, middle of the SPHEREx data so far: where to search for a moving star
 
@@ -32,9 +31,7 @@ def start_live_view(tracked, images, show):
         return None
     return LiveView(tracked, len(images), float(min(images['t_min'])))
 
-=======
 from .spectrumanalyser import SpectrumAnalyzer
->>>>>>> 516ac70cad3f4855c78637eb3615c83afab0ab17
 
 def make_zooms(frames, zoom_only):
     """Original-pixel zoom of every frame, in order. zoom_only=True releases each frame's full-size pixel
@@ -136,6 +133,17 @@ def field_check(frames, coord):
         return None, None
 
 
+def sky_map(frames, coord):
+    """Name every object in the frames and find the new ones (skymap.py). Needs the full pixels. None if the
+    reference services can't be reached (never stops the run)."""
+    from .skymap import map_sky
+    try:
+        return map_sky(frames, coord)
+    except RuntimeError as e:
+        print(f'Sky map skipped: {e}')
+        return None
+
+
 def run_fixed_target(star, settings, max_images=cfg.MAX_IMAGES, show=True, zoom_only=cfg.ZOOM_ONLY):
     """The analysis of anything fixed on the sky, or moving by a known proper motion: a named star (from SIMBAD)
     or a sky position (no motion). See run_named_star / run_coords."""
@@ -168,6 +176,9 @@ def run_fixed_target(star, settings, max_images=cfg.MAX_IMAGES, show=True, zoom_
         check_alignment(frames, tracked['field_stars'])        # verifies the pointing, never adjusts it
         detection = detection_summary(frames)                  # (needs the full pixels: before make_zooms)
         tracked['field'], field = field_check(frames, now)     # vs Gaia / CatWISE / JPL (needs the full pixels)
+        sky = None
+        if settings.get('mode') == 'coordinates' or cfg.SKYMAP_FOR_ALL_TARGETS:
+            sky = tracked['skymap'] = sky_map(frames, now)      # name every object, find the new ones
         movement = track_object(frames)                        # SPHEREx alone: position vs T1
         catalog_motion = compare_with_catalog(frames, movement, star)     # vs SIMBAD/Gaia proper motion
         brightness = brightness_changes(frames)                # brightness vs its own spectrum (variability)
@@ -190,7 +201,7 @@ def run_fixed_target(star, settings, max_images=cfg.MAX_IMAGES, show=True, zoom_
 
     results = {'tracked': tracked, 'frames': frames, 'zooms': zooms, 'movement': movement, 'brightness': brightness,
                'spectrum': spectrum, 'detection': detection, 'catalog_motion': catalog_motion,
-               'contamination': contamination, 'field': field}
+               'contamination': contamination, 'field': field, 'skymap': sky}
     if cfg.SAVE_RESULTS:
         save_results(results, {**settings, 'max_images': max_images})
     if show:
@@ -206,11 +217,32 @@ def run_asteroid(asteroid=cfg.ASTEROID, window=cfg.ASTEROID_WINDOW, max_images=c
                  zoom_only=cfg.ZOOM_ONLY):
     """A moving object: JPL Horizons predicts where the asteroid was at every SPHEREx exposure, IRSA finds
     the images that caught it, and each image is cut around the predicted position and measured there."""
+    tracked = find_asteroid(asteroid, window)                  # its path, from JPL Horizons
+    return run_moving(tracked, {'mode': 'asteroid', 'asteroid': asteroid, 'window': window}, max_images, show, zoom_only)
+
+
+def run_path(name, mjd, ra, dec, max_images=cfg.MAX_IMAGES, show=True, zoom_only=cfg.ZOOM_ONLY):
+    """A moving object with no known orbit, along a straight path fitted to its detections (a new object found
+    by the sky map): every SPHEREx image along that path in its time span is searched for it."""
+    from .moving import Ephemeris
+    t = np.linspace(min(mjd), max(mjd), 50)
+    order = np.argsort(mjd)
+    ra_t = np.degrees(np.interp(t, np.asarray(mjd)[order], np.unwrap(np.radians(np.asarray(ra)[order])))) % 360
+    dec_t = np.interp(t, np.asarray(mjd)[order], np.asarray(dec)[order])
+    tracked = {'name': name, 'asteroid': None, 'ephemeris': Ephemeris.from_arrays(t, ra_t, dec_t),
+               'window': (min(mjd), max(mjd))}
+    print(f'Tracking {name} along its fitted path, MJD {min(mjd):.2f} - {max(mjd):.2f}')
+    return run_moving(tracked, {'mode': 'path', 'name': name, 'mjd': list(mjd), 'ra': list(ra), 'dec': list(dec)},
+                      max_images, show, zoom_only, spacing_deg=0.05)
+
+
+def run_moving(tracked, settings, max_images=cfg.MAX_IMAGES, show=True, zoom_only=cfg.ZOOM_ONLY,
+               spacing_deg=cfg.GRID_SPACING_DEG):
+    """The analysis of anything moving along a known path (tracked['ephemeris'])."""
     start = time.time()
     live = None
     try:
-        tracked = find_asteroid(asteroid, window)              # its path, from JPL Horizons
-        images = find_images(tracked)                          # the SPHEREx images that caught it
+        images = find_images(tracked, spacing_deg)             # the SPHEREx images that caught it
         if not len(images):
             raise RuntimeError('No SPHEREx image caught the asteroid in this window - try another window (config.py)')
         if max_images:
@@ -233,7 +265,7 @@ def run_asteroid(asteroid=cfg.ASTEROID, window=cfg.ASTEROID_WINDOW, max_images=c
 
     results = {'tracked': tracked, 'frames': frames, 'zooms': zooms, 'movement': movement}
     if cfg.SAVE_RESULTS:
-        save_results(results, {'mode': 'asteroid', 'asteroid': asteroid, 'window': window, 'max_images': max_images})
+        save_results(results, {**settings, 'max_images': max_images})
     if show:
         show_viewer(zooms, tracked, movement)
         show_motion(frames, tracked, movement)
@@ -284,9 +316,68 @@ def run_star(ra_deg=cfg.RA_DEG, dec_deg=cfg.DEC_DEG, max_images=cfg.MAX_IMAGES, 
     return results
 
 
+def run_catalog_star(star, max_images=cfg.MAX_IMAGES, show=True, zoom_only=cfg.ZOOM_ONLY):
+    """A star picked from the sky map (Gaia / Hipparcos position, motion and parallax)."""
+    return run_fixed_target(star, {'mode': 'catalog star', 'star': star}, max_images, show, zoom_only)
+
+
+def run_track(spec, max_images=cfg.MAX_IMAGES, show=True, zoom_only=cfg.ZOOM_ONLY):
+    """Track an object picked in the viewer (see skymap.py: each mapped object carries how to track it)."""
+    kind = spec['kind']
+    if kind == 'star':
+        return run_catalog_star(spec['star'], max_images, show, zoom_only)
+    if kind == 'asteroid':
+        return run_asteroid(spec['id'], tuple(spec['window']), max_images, show, zoom_only)
+    if kind == 'coords':
+        return run_coords(tuple(spec['coords']), max_images, show, zoom_only)
+    if kind == 'path':
+        return run_path(spec['name'], spec['mjd'], spec['ra'], spec['dec'], max_images, show, zoom_only)
+    print(f"Can't track {spec.get('name', 'this object')}: {spec.get('reason', 'not supported')}")
+    return None
+
+
+def run_settings(settings, max_images=None, show=True, zoom_only=cfg.ZOOM_ONLY):
+    """Re-run a target from the settings stored with its results (the known-objects list)."""
+    mode = settings.get('mode')
+    max_images = max_images if max_images is not None else settings.get('max_images')
+    if mode == 'asteroid':
+        return run_asteroid(settings['asteroid'], tuple(settings['window']), max_images, show, zoom_only)
+    if mode == 'named star':
+        return run_named_star(settings['star'], max_images, show, zoom_only)
+    if mode == 'coordinates':
+        coords = settings['coords']
+        return run_coords(tuple(coords) if isinstance(coords, list) else coords, max_images, show, zoom_only)
+    if mode == 'catalog star':
+        return run_catalog_star(settings['star'], max_images, show, zoom_only)
+    if mode == 'path':
+        return run_path(settings['name'], settings['mjd'], settings['ra'], settings['dec'], max_images, show, zoom_only)
+    if mode == 'star':
+        return run_star(float(settings['ra_deg']), float(settings['dec_deg']), max_images, show, zoom_only)
+    raise ValueError(f'Unknown kind of run: {mode}')
+
+
+def interactive(max_images=None):
+    """The start window (launcher.py): pick a known object or enter coordinates; then the analysis and its
+    windows. Objects picked in the viewer (press T) are tracked next; closing all windows returns here."""
+    from .launcher import choose_target
+    from .plots import take_track_request
+    while True:
+        choice = choose_target()
+        if choice is None:
+            return
+        try:
+            run_settings(choice, max_images)
+            spec = take_track_request()
+            while spec:
+                run_track(spec, max_images)
+                spec = take_track_request()
+        except Exception as e:                              # back to the start window, not a crash
+            print(f'\nThat run stopped: {type(e).__name__}: {e}\n')
+
+
 def cli(argv=None):
     """Command line: python -m Jonah_Code_File [--coords "RA Dec" | --star NAME | --asteroid ID] ...
-    Without a target option, config.py decides."""
+    With no options: the start window (pick a known object, or enter coordinates). --config: config.py's target."""
     parser = argparse.ArgumentParser(prog='python -m Jonah_Code_File',
                                      description='SPHEREx transient / moving-object analysis (settings: config.py)')
     target = parser.add_mutually_exclusive_group()
@@ -295,12 +386,22 @@ def cli(argv=None):
     target.add_argument('--asteroid', help="an asteroid or comet (JPL Horizons id), e.g. 433")
     parser.add_argument('--window', nargs=2, metavar=('START', 'END'), help='asteroid search window, e.g. 2026-02-15 2026-06-15')
     parser.add_argument('--max-images', type=int, help='only the first N images (quick test)')
+    target.add_argument('--config', action='store_true', help="the target set in config.py (no start window)")
     parser.add_argument('--no-show', action='store_true', help="don't open any windows (results are still saved)")
     args = parser.parse_args(argv)
 
+    if not (args.coords or args.star or args.asteroid or args.config or args.no_show):
+        return interactive(args.max_images)
     options = dict(max_images=args.max_images if args.max_images else cfg.MAX_IMAGES, show=not args.no_show,
                    window=tuple(args.window) if args.window else cfg.ASTEROID_WINDOW)
-    return run(asteroid=args.asteroid, star=args.star, coords=args.coords, **options)   # none given: config.py's
+    results = run(asteroid=args.asteroid, star=args.star, coords=args.coords, **options)   # none given: config.py's
+    if not args.no_show:                                    # an object picked in the viewer (T): track it next
+        from .plots import take_track_request
+        spec = take_track_request()
+        while spec:
+            results = run_track(spec, options['max_images'])
+            spec = take_track_request()
+    return results
 
 
 if __name__ == '__main__':

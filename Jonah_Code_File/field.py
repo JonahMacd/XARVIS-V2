@@ -16,6 +16,7 @@ Nothing here changes the target's measurements - it only adds context.
 
 import json
 import threading
+import time as time_module
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -80,13 +81,15 @@ def query_field(coord, radius=None, quiet=False):
     gaia_part = Table({'source': ['Gaia'] * int(keep.sum()), 'name': [f'Gaia DR3 {s}' for s in np.array(gaia['source_id'])[keep]],
                        'ra': column(gaia, 'ra')[keep], 'dec': column(gaia, 'dec')[keep],
                        'pmra': column(gaia, 'pmra')[keep], 'pmdec': column(gaia, 'pmdec')[keep],
-                       'epoch_mjd': np.full(int(keep.sum()), GAIA_EPOCH_MJD), 'mag': rp[keep]})
+                       'epoch_mjd': np.full(int(keep.sum()), GAIA_EPOCH_MJD), 'mag': rp[keep],
+                       'parallax': column(gaia, 'parallax')[keep]})
     w1 = column(wise, 'w1mpro', 99.0)
     keep = w1 <= cfg.FIELD_W1_MAX
     wise_part = Table({'source': ['CatWISE'] * int(keep.sum()), 'name': [str(s) for s in np.array(wise['source_name'])[keep]],
                        'ra': column(wise, 'ra')[keep], 'dec': column(wise, 'dec')[keep],
                        'pmra': column(wise, 'pmra')[keep] * 1000, 'pmdec': column(wise, 'pmdec')[keep] * 1000,   # "/yr -> mas/yr
-                       'epoch_mjd': np.full(int(keep.sum()), CATWISE_EPOCH_MJD), 'mag': w1[keep]})
+                       'epoch_mjd': np.full(int(keep.sum()), CATWISE_EPOCH_MJD), 'mag': w1[keep],
+                       'parallax': np.zeros(int(keep.sum()))})
     # CatWISE's proper motions are only good for fast movers; ignore the small (noisy) ones
     small = np.hypot(wise_part['pmra'], wise_part['pmdec']) < 200
     wise_part['pmra'][small] = 0.0
@@ -166,12 +169,14 @@ def compare_frame(frame, field):
     inside = (cat_x > -3) & (cat_x < nx + 2) & (cat_y > -3) & (cat_y < ny + 2)
     matched = np.zeros(len(xs), dtype=bool)
     seen = np.zeros(int(inside.sum()), dtype=bool)          # catalog sources SPHEREx detects in this frame
+    peak_cat = -np.ones(len(xs), dtype=int)                 # per peak: the catalog row it matched (-1: none)
     offsets = []
     if inside.any() and len(xs):
         d = np.hypot(xs[:, None] - cat_x[None, inside], ys[:, None] - cat_y[None, inside])
         nearest = np.argmin(d, axis=1)
         matched = d[np.arange(len(xs)), nearest] <= cfg.FIELD_MATCH_PIX
         seen = (d <= cfg.FIELD_MATCH_PIX).any(axis=0)
+        peak_cat[matched] = np.flatnonzero(inside)[nearest[matched]]
         is_gaia = np.asarray(field['source'])[inside] == 'Gaia'
         clean_image = np.where(frame['bad'], np.nan, frame['image'])
         for i in np.flatnonzero(matched):
@@ -189,7 +194,7 @@ def compare_frame(frame, field):
     return {'peak_x': xs, 'peak_y': ys, 'peak_sigma': significance, 'peak_ra': np.atleast_1d(peak_ra),
             'peak_dec': np.atleast_1d(peak_dec), 'matched': matched, 'peak_clean': clean,
             'cat_x': cat_x[inside], 'cat_y': cat_y[inside], 'cat_source': np.asarray(field['source'])[inside],
-            'cat_gaia_match': np.asarray(field['gaia_match'])[inside], 'cat_seen': seen, 'offset_px': np.array(offsets).reshape(-1, 2)}
+            'cat_gaia_match': np.asarray(field['gaia_match'])[inside], 'cat_seen': seen, 'cat_index': np.flatnonzero(inside), 'peak_cat': peak_cat, 'offset_px': np.array(offsets).reshape(-1, 2)}
 
 
 # ----------------------------------------------------------------------------
@@ -283,6 +288,32 @@ def _group(detections, frames):
 _ident_lock = threading.Lock()
 _ident_results = {}
 
+# JPL's limit (measured, from its HTTP 429 reply): "20 requests per 5 minutes" for sb_ident.api. Requests are spaced
+# to stay under it - also across runs (the times of recent requests are kept next to the cache).
+SB_IDENT_LIMIT, SB_IDENT_WINDOW_S = 18, 300
+_sb_slot_lock = threading.Lock()
+
+
+def _sb_ident_slot():
+    """Wait until another SB Ident request fits within JPL's rate limit, and record it."""
+    path = cache.cache_dir().parent / 'jpl_sb_ident_requests.json'
+    with _sb_slot_lock:
+        try:
+            recent = [t for t in json.loads(path.read_text()) if time_module.time() - t < SB_IDENT_WINDOW_S]
+        except (OSError, ValueError):
+            recent = []
+        if len(recent) >= SB_IDENT_LIMIT:
+            wait = SB_IDENT_WINDOW_S - (time_module.time() - min(recent)) + 1
+            print(f'  JPL SB Ident: {len(recent)} requests in the last 5 minutes (JPL allows 20) - waiting {wait:.0f} s...')
+            time_module.sleep(max(wait, 0))
+            recent = [t for t in recent if time_module.time() - t < SB_IDENT_WINDOW_S]
+        recent.append(time_module.time())
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(recent))
+        except OSError:
+            pass
+
 
 def known_small_bodies(mjd, ra_deg, dec_deg, half_width_deg=None):
     """Known asteroids and comets within a box around (ra, dec) at time `mjd`, from JPL SB Ident (geocentric -
@@ -299,12 +330,25 @@ def known_small_bodies(mjd, ra_deg, dec_deg, half_width_deg=None):
     key = cache.make_key(SB_IDENT_URL, *sorted(params.items()))
     content = cache.get('sb_ident', key)
     if content is None:
-        def once():
-            response = requests.get(SB_IDENT_URL, params=params, timeout=120)
-            if response.status_code != 200:
-                raise BadResponse(f'HTTP {response.status_code}')
-            return response.content
-        content = with_retries('JPL SB Ident', once, quiet=True)
+        content, last = None, None
+        for attempt in range(3):
+            _sb_ident_slot()                                # JPL allows 20 requests per 5 minutes
+            try:
+                response = requests.get(SB_IDENT_URL, params=params, timeout=120)
+                if response.status_code == 200:
+                    content = response.content
+                    break
+                last = f'HTTP {response.status_code}'
+                if response.status_code == 429:             # over the limit anyway: wait as long as JPL asks
+                    wait = min(float(response.headers.get('Retry-After', 300) or 300), 300)
+                    print(f'  JPL SB Ident: rate limit reached - waiting {wait:.0f} s as JPL asks...')
+                    time_module.sleep(wait)
+                    continue
+            except requests.RequestException as e:
+                last = type(e).__name__
+            time_module.sleep(5 * 2 ** attempt)
+        if content is None:
+            raise RuntimeError(f'JPL SB Ident: no answer after 3 attempts ({last})')
         cache.put('sb_ident', key, content)
     data = json.loads(content)
     fields = data.get('fields_second') or data.get('fields_first') or []
@@ -317,10 +361,15 @@ def known_small_bodies(mjd, ra_deg, dec_deg, half_width_deg=None):
             sky = SkyCoord(entry['Astrometric RA (hh:mm:ss)'], ' '.join(dec_text), unit=(u.hourangle, u.deg))
         except (KeyError, ValueError):
             continue
-        vmag = entry.get('Visual magnitude (V)')
+        def number(key):
+            try:
+                return float(entry.get(key))
+            except (TypeError, ValueError):
+                return np.nan
         bodies.append({'name': entry.get('Object name', '?'), 'ra': float(sky.ra.deg), 'dec': float(sky.dec.deg),
-                       'vmag': float(vmag) if vmag not in (None, '') else np.nan,
-                       'offset_arcsec': float(sky.separation(centre).arcsec)})
+                       'vmag': number('Visual magnitude (V)'),
+                       'ra_rate': number('RA rate ("/h)'), 'dec_rate': number('Dec rate ("/h)'),   # "/hour, RA*cos(Dec)
+                       'offset_arcsec': float(sky.separation(centre).arcsec), 'mjd': float(mjd)})
     return bodies
 
 

@@ -1,5 +1,6 @@
 """Figures: a frame viewer for every image, movement and brightness over time, and the spectrum check."""
 
+import textwrap
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -134,7 +135,7 @@ def fmt_angle(arcsec):
 
 
 def draw_zoom(ax, zoom, index, total, t0, movement, brightness=None, compact=False, pretty=False, partner=None,
-              anchor=None, factor=None):
+              anchor=None, factor=None, marks=None):
     """Draw one frame's zoom into `ax`.
     pretty=False: the original pixels in grayscale, each pixel a sharp square (what was measured).
     pretty=True: display-only colour (from the comparison with `partner`, the simultaneous frame at another
@@ -143,7 +144,8 @@ def draw_zoom(ax, zoom, index, total, t0, movement, brightness=None, compact=Fal
     where a star was at T1, or where the ephemeris predicted an asteroid (drawn only if it is in the zoom).
     `t0` = time of T1 (MJD). `brightness` = the star's brightness analysis (None for an asteroid).
     `compact` = shorter title, for the grid. `anchor` (pretty only, see visual.anchors): draw the target at the
-    same brightness and in the same colour in every frame. Returns the image (for a color bar)."""
+    same brightness and in the same colour in every frame. `marks` = {'red': (ra, dec) or None, 'blue': ...} puts
+    the two circles on another object instead (one selected in the viewer). Returns the image (for a color bar)."""
     if pretty:
         rgb, extent = render(zoom, partner, factor=factor, anchor=anchor)
         im = ax.imshow(rgb, origin='lower', extent=extent, interpolation='bilinear')
@@ -154,15 +156,23 @@ def draw_zoom(ax, zoom, index, total, t0, movement, brightness=None, compact=Fal
         im = ax.imshow(zoom['image'], origin='lower', cmap='gray', vmin=sky - 3 * noise, vmax=sky + 15 * noise,
                        interpolation='nearest')       # each original pixel as a sharp square
     # circles placed by sky position, converted to this frame's pixels (so they stay round)
-    reference = movement['reference']
-    reference = reference[index] if reference.shape else reference          # one position per frame, or one for all
-    ref_x, ref_y = (float(v) for v in zoom['wcs'].world_to_pixel(reference))
-    if 0 <= ref_x < zoom['image'].shape[1] and 0 <= ref_y < zoom['image'].shape[0]:
-        ax.add_patch(Circle((ref_x, ref_y), cfg.APERTURE_RADIUS_PIX + 0.6,
-                            edgecolor='deepskyblue', facecolor='none', lw=1.5, ls='--'))
-    now_xy = zoom['wcs'].world_to_pixel_values(zoom['object_ra'], zoom['object_dec'])
-    ax.add_patch(Circle((float(now_xy[0]), float(now_xy[1])), cfg.APERTURE_RADIUS_PIX,
-                        edgecolor='red', facecolor='none', lw=1.3))
+    if marks is None:                                       # the analysed object
+        reference = movement['reference']
+        reference = reference[index] if reference.shape else reference      # one position per frame, or one for all
+        blue = (float(reference.ra.deg), float(reference.dec.deg))
+        red = (zoom['object_ra'], zoom['object_dec'])
+    else:                                                   # an object selected in the viewer (see show_viewer)
+        blue, red = marks.get('blue'), marks.get('red')
+    ny, nx = zoom['image'].shape
+    if blue is not None:
+        ref_x, ref_y = (float(v) for v in zoom['wcs'].world_to_pixel_values(*blue))
+        if 0 <= ref_x < nx and 0 <= ref_y < ny:
+            ax.add_patch(Circle((ref_x, ref_y), cfg.APERTURE_RADIUS_PIX + 0.6,
+                                edgecolor='deepskyblue', facecolor='none', lw=1.5, ls='--', zorder=9))
+    if red is not None:
+        now_x, now_y = (float(v) for v in zoom['wcs'].world_to_pixel_values(*red))
+        ax.add_patch(Circle((now_x, now_y), cfg.APERTURE_RADIUS_PIX, edgecolor='red', facecolor='none', lw=1.3,
+                            zorder=9))
 
     moved = movement['flagged'][index]
     changed = bool(brightness['flagged'][index]) if brightness else False
@@ -330,6 +340,131 @@ def overlay_catalog(ax, display, field, bodies=None):
     return text
 
 
+_track_request = {}
+
+
+def request_track(spec):
+    """Ask main to track this object next (after the current windows close)."""
+    _track_request['spec'] = spec
+
+
+def take_track_request():
+    """The object picked in the viewer to track next (see request_track), or None; clears it."""
+    return _track_request.pop('spec', None)
+
+
+MAP_STYLE = {   # how each kind of mapped object is drawn (see skymap.py)
+    'new': dict(color='#ffe600'), 'small body': dict(color='magenta'), 'planet': dict(color='#7CFC00'),
+    'artifact': dict(color='0.6'), 'Gaia': dict(color='#4fd2ff'), 'CatWISE': dict(color='#ff9a3c'),
+    'Hipparcos': dict(color='white'),
+}
+NEW_MARKER_SIZE = 420           # points^2: the ring around a NEW object
+
+
+def map_legend():
+    """Legend handles for the sky map: what every marker means."""
+    def handle(label, **style):
+        return Line2D([], [], linestyle='none', label=label, **style)
+    new = MAP_STYLE['new']['color']
+    return [handle('NEW object: in no catalog\n(not previously mapped)', marker='o', markersize=14, markerfacecolor='none',
+                   markeredgecolor=new, markeredgewidth=2.6),
+            handle('named star (Hipparcos +\nStellarium name)', marker='*', markersize=10, markerfacecolor='none',
+                   markeredgecolor='white'),
+            handle('Gaia DR3 star', marker='+', markersize=8, color=MAP_STYLE['Gaia']['color']),
+            handle('CatWISE only (red / dusty)', marker='x', markersize=7, color=MAP_STYLE['CatWISE']['color']),
+            handle('known asteroid / comet (JPL)', marker='D', markersize=7, markerfacecolor='none',
+                   markeredgecolor=MAP_STYLE['small body']['color']),
+            handle('planet / Moon (DE440s)', marker='D', markersize=7, markerfacecolor='none',
+                   markeredgecolor=MAP_STYLE['planet']['color']),
+            handle('flagged detector artifact', marker='s', markersize=7, markerfacecolor='none',
+                   markeredgecolor=MAP_STYLE['artifact']['color'])]
+
+
+def draw_map(ax, display, entries):
+    """The sky map of one frame (frame['map'], see skymap.map_frames) on `display`: every star with its catalog
+    (named / Hipparcos stars labelled), known asteroids / comets and planets (labelled), flagged artifacts, and NEW
+    objects (yellow, labelled with what they probably are). Returns [(x, y, entry)] of what was drawn and a summary."""
+    ny, nx = display['image'].shape
+    small = ny > 2 * cfg.ZOOM_SIZE_PIX
+    drawn, counts = [], {}
+    for entry in entries:
+        x, y = (float(v) for v in display['wcs'].world_to_pixel_values(entry['ra'], entry['dec']))
+        if not (-0.5 <= x < nx - 0.5 and -0.5 <= y < ny - 0.5):
+            continue
+        kind = entry['kind']
+        key = entry.get('source', kind) if kind == 'star' else kind
+        counts[key] = counts.get(key, 0) + 1
+        color = MAP_STYLE.get(key, {'color': 'white'})['color']
+        if kind == 'star':
+            if entry.get('named'):
+                ax.scatter([x], [y], marker='*', s=60 if not small else 25, facecolor='none', edgecolor='white', lw=0.9, zorder=6)
+                ax.annotate(entry['label'], (x, y), xytext=(6, 4), textcoords='offset points', color='white',
+                            fontsize=7, zorder=8)
+            else:
+                ax.scatter([x], [y], marker='+' if entry['source'] == 'Gaia' else 'x', s=12 if small else 28,
+                           color=color, lw=0.9, zorder=5)
+        elif kind == 'artifact':
+            ax.scatter([x], [y], marker='s', s=30, facecolor='none', edgecolor=color, lw=0.8, zorder=5)
+        elif kind == 'new':                                 # not in ANY catalog: impossible to miss
+            # (sizes in screen points, so it is just as visible in the wide view)
+            ax.scatter([x], [y], s=NEW_MARKER_SIZE * 2.2, facecolor='none', edgecolor=color, lw=7, alpha=0.25, zorder=7)
+            ax.scatter([x], [y], s=NEW_MARKER_SIZE, facecolor='none', edgecolor=color, lw=2.6, zorder=8)
+            ax.annotate(entry['label'].replace(' (', '\n('), (x, y), xytext=(14, 10), textcoords='offset points',
+                        color='black', fontsize=8, fontweight='bold', zorder=9,
+                        bbox=dict(boxstyle='round,pad=0.25', facecolor=color, edgecolor='none', alpha=0.95),
+                        arrowprops=dict(arrowstyle='-', color=color, lw=1.4))
+        else:                                               # small body / planet
+            ax.scatter([x], [y], marker='D', s=45, facecolor='none', edgecolor=color, lw=1.3, zorder=7)
+            name = entry['label'].split('(')[0].strip() or entry['label']
+            ax.annotate(name + ('' if entry.get('detected') else ' (not detected)'), (x, y), xytext=(6, 5),
+                        textcoords='offset points', color=color, fontsize=7, zorder=8)
+        drawn.append((x, y, entry))
+    ax.set_xlim(-0.5, nx - 0.5)
+    ax.set_ylim(-0.5, ny - 0.5)
+    parts = [f"{counts[k]} {label}" for k, label in (('Hipparcos', 'Hipparcos'), ('Gaia', 'Gaia DR3 (+)'),
+             ('CatWISE', 'CatWISE (x)'), ('small body', 'known asteroid/comet'), ('planet', 'planet'),
+             ('artifact', 'flagged artifact'), ('new', 'NEW (yellow)')) if counts.get(k)]
+    return drawn, 'mapped: ' + (', '.join(parts) or 'nothing detected') + '   - click an object, T = track it'
+
+
+def _object_key(entry):
+    """What identifies one mapped object across frames (its catalog row, JPL designation or NEW id)."""
+    kind = entry['kind']
+    return kind, {'star': entry.get('catalog_row'), 'small body': entry.get('body'),
+                  'new': entry.get('new_id')}.get(kind, entry['label'])
+
+
+def object_positions(zooms, entry):
+    """{frame index: (ra, dec)} of the mapped object `entry` in every frame where the sky map has it."""
+    key, positions = _object_key(entry), {}
+    for i, zoom in enumerate(zooms):
+        for other in zoom.get('map', []):
+            if _object_key(other) == key:
+                positions[i] = (other['ra'], other['dec'])
+                break
+    return positions
+
+
+def track_spec(entry, tracked, frame_mjd):
+    """How to track a mapped object (for request_track), or a spec with 'reason' if it can't be tracked."""
+    sky = tracked.get('skymap') or {}
+    kind = entry['kind']
+    if kind == 'star':
+        from .skymap import star_to_track
+        return {'kind': 'star', 'star': star_to_track(sky['catalog'][entry['catalog_row']]), 'name': entry['label']}
+    if kind == 'small body':
+        from astropy.time import Time
+        window = [Time(frame_mjd - 45, format='mjd').iso[:10], Time(frame_mjd + 45, format='mjd').iso[:10]]
+        return {'kind': 'asteroid', 'id': entry['body'], 'window': window, 'name': entry['label']}
+    if kind == 'new':
+        for obj in sky.get('new_objects', []):
+            if obj['id'] == entry['new_id']:
+                return obj['track']
+    if kind == 'artifact':
+        return {'kind': 'none', 'name': entry['label'], 'reason': 'a flagged detector artifact, not a source'}
+    return {'kind': 'none', 'name': entry['label'], 'reason': 'planets are far too bright for SPHEREx to measure'}
+
+
 def show_viewer(zooms, tracked, movement, brightness=None, pretty=None):
     """Step through every frame. Red circle = where the object was found in this frame; blue dashed circle =
     the reference position (see draw_zoom). pretty (default config.PRETTY_IMAGES): colour, sharpening and
@@ -338,7 +473,9 @@ def show_viewer(zooms, tracked, movement, brightness=None, pretty=None):
     Controls: slider, left/right arrow keys, F = jump to the next flagged frame,
               W = wide view (WIDE_VIEW_SIZE arcmin of the same image, downloaded on demand) / back to the zoom,
               G = Gaia DR3 + CatWISE overlay (and SPHEREx sources no catalog explains),
-              J = ask JPL which known asteroids / comets are in view (~20 s, in the background)."""
+              J = ask JPL which known asteroids / comets are in view (~20 s, in the background).
+    With a sky map (coordinates: tracked['skymap']), G shows it - every object named, NEW ones in yellow; click an
+    object to see what it is, then T to track it (the windows close and its analysis starts)."""
     from .field import identified, identify_async, query_field
     n = len(zooms)
     pretty = cfg.PRETTY_IMAGES if pretty is None else pretty
@@ -348,13 +485,21 @@ def show_viewer(zooms, tracked, movement, brightness=None, pretty=None):
     moving = 'ephemeris' in tracked
     flagged = np.flatnonzero(movement['flagged'] | (brightness['flagged'] if brightness else False))
     plt.rcParams['keymap.grid'] = [k for k in plt.rcParams['keymap.grid'] if k != 'g']   # G is ours here
-    fig = plt.figure(figsize=(8.5, 9.4))
+    has_map = any('map' in z for z in zooms)
+    if has_map:     # wider window: the sky-map key gets its own column on the right
+        layout = {'size': (11.5, 9.4), 'image': [0.08, 0.15, 0.56, 0.7], 'cbar': [0.66, 0.2, 0.02, 0.6],
+                  'slider': [0.11, 0.035, 0.53, 0.025], 'status_x': 0.37, 'legend_x': 0.775}
+    else:
+        layout = {'size': (8.5, 9.4), 'image': [0.12, 0.15, 0.68, 0.7], 'cbar': [0.86, 0.2, 0.025, 0.6],
+                  'slider': [0.14, 0.035, 0.66, 0.025], 'status_x': 0.5, 'legend_x': None}
+    fig = plt.figure(figsize=layout['size'])
     if pretty:
         fig.patch.set_facecolor('0.12')
-    slider = Slider(fig.add_axes([0.14, 0.035, 0.66, 0.025]), 'Frame', 1, n, valinit=1, valstep=1, valfmt='T%d')
-    cbar_ax = fig.add_axes([0.86, 0.2, 0.025, 0.6])
-    status = fig.text(0.5, 0.075, '', ha='center', fontsize=8, color='0.8' if pretty else '0.3')
-    state = {'ax': None, 'i': 0, 'wide': False, 'catalog': False, 'waiting': set()}
+    slider = Slider(fig.add_axes(layout['slider']), 'Frame', 1, n, valinit=1, valstep=1, valfmt='T%d')
+    cbar_ax = fig.add_axes(layout['cbar'])
+    status = fig.text(layout['status_x'], 0.075, '', ha='center', fontsize=8, color='0.8' if pretty else '0.3')
+    state = {'ax': None, 'i': 0, 'wide': False, 'catalog': has_map, 'waiting': set(), 'drawn': [], 'selected': None,
+             'selected_positions': {}}
     pool = ThreadPoolExecutor(max_workers=3)
     jobs = {}
 
@@ -393,17 +538,40 @@ def show_viewer(zooms, tracked, movement, brightness=None, pretty=None):
                 display_partner = answers[1] if len(answers) > 1 and answers[1] else None
                 factor = cfg.WIDE_VIEW_UPSCALE
         anchor = {'xy': target_xy(display), 'colour': colour} if pretty else None
+        marks = None
+        if state['selected'] is not None:                  # the circles follow the selected object
+            positions = state['selected_positions']
+            first = min(positions) if positions else None
+            marks = {'red': positions.get(i),
+                     'blue': positions[first] if first is not None else (state['selected']['ra'], state['selected']['dec'])}
+            label = state['selected']['label']
+            legend_text = [f"{label} at its first sighting" + (f" (T{first + 1})" if first is not None else ''),
+                           f"{label} in this frame"]
+        else:
+            legend_text = [movement['reference_label'], 'object found in this frame']
+        for text, value in zip(state['circle_legend'].get_texts() if 'circle_legend' in state else [], legend_text):
+            text.set_text(value)
         if state['ax'] is not None:
             state['ax'].remove()
-        ax = state['ax'] = fig.add_axes([0.12, 0.15, 0.68, 0.7], projection=display['wcs'])
+        ax = state['ax'] = fig.add_axes(layout['image'], projection=display['wcs'])
         im = draw_zoom(ax, display, i, n, zooms[0]['mjd'], movement, brightness, pretty=pretty,
-                       partner=display_partner, anchor=anchor, factor=factor)
+                       partner=display_partner, anchor=anchor, factor=factor, marks=marks)
         if display is not zoom:
             _footprint(ax, display, zoom)
         ax.coords[0].set_axislabel('RA')
         ax.coords[1].set_axislabel('Dec')
 
-        if state['catalog']:
+        state['drawn'] = []
+        if state['catalog'] and 'map' in zoom:
+            state['drawn'], text = draw_map(ax, display, zoom['map'])
+            notes.append(text)
+            selected = state['selected']
+            if selected is not None:
+                notes.append(f"SELECTED: {selected['label']}" + (f" - {selected['info']}" if selected.get('info') else '')
+                             + ('' if selected['kind'] in ('artifact', 'planet') else '   (T = track it)')
+                             + ('' if marks and marks['red'] else '   - not detected in this frame')
+                             + '   (click empty sky to go back to the target)')
+        elif state['catalog']:
             ny, nx = display['image'].shape
             centre = display['wcs'].pixel_to_world((nx - 1) / 2, (ny - 1) / 2)
             radius = np.hypot(nx, ny) / 2 * cfg.PIXEL_ARCSEC * u.arcsec
@@ -429,7 +597,7 @@ def show_viewer(zooms, tracked, movement, brightness=None, pretty=None):
         else:
             cbar_ax.clear()
             fig.colorbar(im, cax=cbar_ax, label='MJy/sr (zodi subtracted)')
-        status.set_text('\n'.join(notes))
+        status.set_text('\n'.join(textwrap.fill(note, 120) for note in notes))
         fig.canvas.draw_idle()
 
     def check_waiting():
@@ -464,18 +632,45 @@ def show_viewer(zooms, tracked, movement, brightness=None, pretty=None):
             jobs[jpl_key] = True                       # (marks the lookup as asked for)
             identify_async(jpl_key, zooms[i]['mjd'], zooms[i]['expected_ra'], zooms[i]['expected_dec'], half)
             draw(i)
+        elif key == 't' and state['selected'] is not None:
+            spec = track_spec(state['selected'], tracked, zooms[i]['mjd'])
+            if spec['kind'] == 'none':
+                status.set_text(f"Can't track {spec['name']}: {spec['reason']}")
+                fig.canvas.draw_idle()
+            else:
+                print(f"\nTracking {spec.get('name', state['selected']['label'])} next...")
+                request_track(spec)
+                plt.close('all')                           # main starts its analysis when the windows are closed
+
+    def on_click(event):
+        """Select the mapped object nearest the click (within 3 original pixels)."""
+        if event.inaxes is not state['ax'] or not state['drawn'] or event.xdata is None:
+            return
+        x, y = event.xdata, event.ydata
+        distance = [np.hypot(dx - x, dy - y) for dx, dy, _ in state['drawn']]
+        k = int(np.argmin(distance))
+        state['selected'] = state['drawn'][k][2] if distance[k] <= 3 else None
+        state['selected_positions'] = object_positions(zooms, state['selected']) if state['selected'] else {}
+        draw(state['i'])
 
     slider.on_changed(lambda value: draw(int(value) - 1))
     fig.canvas.mpl_connect('key_press_event', on_key)
+    fig.canvas.mpl_connect('button_press_event', on_click)
     timer = fig.canvas.new_timer(interval=400)
     timer.add_callback(check_waiting)
     timer.start()
     fig.canvas.mpl_connect('close_event', lambda event: (timer.stop(), pool.shutdown(wait=False, cancel_futures=True)))
-    fig.legend(handles=circle_legend(movement), loc='upper right', fontsize=9)
+    state['circle_legend'] = fig.legend(handles=circle_legend(movement), loc='upper right', fontsize=9)
     if pretty:                                              # (moved below the two-line title)
-        fig.legends[-1].set_bbox_to_anchor((0.99, 0.925), transform=fig.transFigure)
+        state['circle_legend'].set_bbox_to_anchor((0.99, 0.925), transform=fig.transFigure)
+    if has_map:                                             # what every sky-map marker means
+        key = fig.legend(handles=map_legend(), loc='center left', bbox_to_anchor=(layout['legend_x'], 0.5),
+                         fontsize=8, title='Sky map', title_fontsize=9, labelspacing=1.1, borderpad=0.8,
+                         facecolor='0.18' if pretty else 'white', edgecolor='0.5', framealpha=1)
+        for text in key.get_texts() + [key.get_title()]:
+            text.set_color('white' if pretty else 'black')
     fig.suptitle(f"SPHEREx: {tracked['name']}   ←/→ step, F next flagged ({len(flagged)}), W wide view, "
-                 f"G Gaia/CatWISE, J JPL asteroids"
+                 + (f"G sky map, click + T track" if has_map else f"G Gaia/CatWISE, J JPL asteroids")
                  + ('\ncolour, sharpening and resolution are for display only - measurements use the original pixels'
                     if pretty else ''), fontsize=10, y=0.995, color='white' if pretty else 'black')
     draw(0)
