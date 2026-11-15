@@ -114,7 +114,8 @@ def query_images_at(ra_deg, dec_deg, radius=0.02):
 
 
 CATALOG_COLUMNS = {'fp_psc': 'designation,ra,dec,j_m,j_msigcom,h_m,h_msigcom,k_m,k_msigcom',
-                   'allwise_p3as_psd': 'designation,ra,dec,w1mpro,w1sigmpro,w2mpro,w2sigmpro'}
+                   'allwise_p3as_psd': 'designation,ra,dec,w1mpro,w1sigmpro,w2mpro,w2sigmpro',
+                   'catwise_2020': 'source_name,ra,dec,pmra,pmdec,w1mpro,w2mpro'}
 
 
 def query_catalog(coord, catalog, radius):
@@ -143,12 +144,19 @@ def fetch_cutout(image_url, coord, size):
     """Small cutout (HDUList) of one SPHEREx image around `coord`, cut server-side by IRSA.
 
     IRSA sends ~4 MB per cutout, mostly a PSF table we don't use; only the extensions we use are kept, and
-    those (~95 KB) are cached on disk so a re-run doesn't download them again (see cache.py)."""
+    those (~95 KB) are cached on disk so a re-run doesn't download them again (see cache.py).
+    (= download_cutout + open_cutout; frames.load_frame calls the two separately.)"""
+    return open_cutout(*download_cutout(image_url, coord, size))
+
+
+def download_cutout(image_url, coord, size):
+    """The waiting part of fetch_cutout: the cutout's bytes from the disk cache or from IRSA, no parsing - so
+    many can run in threads at once. Returns (content, cache key, whether content is already trimmed)."""
     params = {'center': f'{coord.ra.deg:.6f},{coord.dec.deg:.6f}', 'size': f'{size.to_value(u.arcsec)}arcsec'}
     key = cache.make_key(image_url, params['center'], params['size'])
     cached = cache.get('cutouts', key)
     if cached is not None:
-        return fits.open(io.BytesIO(cached), memmap=False)
+        return cached, key, True
 
     def once():
         with _download_slots:                       # at most MAX_CONCURRENT_DOWNLOADS at a time, program-wide
@@ -159,7 +167,14 @@ def fetch_cutout(image_url, coord, size):
             raise ValueError(f'IRSA refused the cutout (HTTP {response.status_code})')
         return response.content
 
-    content = with_retries('Cutout', once, quiet=True)
+    return with_retries('Cutout', once, quiet=True), key, False
+
+
+def open_cutout(content, key, trimmed):
+    """The Python-work part of fetch_cutout: parse the bytes into an HDUList with only the extensions we use
+    (a fresh download is trimmed and cached here). frames.load_frame does this one frame at a time."""
+    if trimmed:
+        return fits.open(io.BytesIO(content), memmap=False)
     with fits.open(io.BytesIO(content), memmap=False) as full:
         hdulist = fits.HDUList([fits.PrimaryHDU(header=full[0].header)])
         for name in ['IMAGE', 'FLAGS', 'VARIANCE', 'ZODI', 'WCS-WAVE']:      # drop the large EPSF table
