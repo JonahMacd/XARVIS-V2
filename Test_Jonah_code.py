@@ -1,4 +1,4 @@
-"""Launcher: the code now lives in the Jonah_Code_File/ folder (settings in Jonah_Code_File/config.py).
+"""Launcher: the code now lives in the Jonah_Code_File/ folder (settings in the project-level config.json).
 
 Run this file, or from this folder: python -m Jonah_Code_File
 """

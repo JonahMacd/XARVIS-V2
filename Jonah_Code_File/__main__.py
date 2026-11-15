@@ -1,6 +1,6 @@
 """Run the analysis: just run this file (e.g. the Run button in VS Code), or: python -m Jonah_Code_File
 
-Settings are in config.py (the asteroid, star or sky position to track, the time window, how many images),
+Settings are in the project-level config.json (the asteroid, star or sky position to track, the time window, how many images),
 or on the command line, e.g.:  python -m Jonah_Code_File --coords "08h55m10.8s -07d14m42s"   (--help for all)
 """
 
