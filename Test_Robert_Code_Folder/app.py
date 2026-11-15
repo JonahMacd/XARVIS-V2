@@ -1,26 +1,37 @@
-"""XARVIS: SPHEREx + solar system viewer (Flask backend). Official sources only.
+"""XARVIS website backend (Flask): the solar system, SPHEREx and small-body data behind the viewer. Official sources only.
 
-Run:  python app.py   then open http://127.0.0.1:5000
+Run:  python app.py   then open http://127.0.0.1:5000   (or http://127.0.0.1:5000/about)
 
-Frame for everything sent to the browser: heliocentric ecliptic J2000, AU, times as Julian Dates (UTC).
+Everything sent to the browser is in the heliocentric ecliptic J2000 frame, in AU, with times as Julian Dates (UTC).
 
 Data sources (all official)
     Planets, Sun, Moon   NASA/JPL DE440s planetary ephemeris (NAIF SPK kernel, 1849-12-26 .. 2150-01-22), read through
                          astropy + jplephem. Outside that range the browser uses JPL's published mean orbital elements.
-    SPHEREx trajectory   NASA/JPL Horizons, spacecraft -163182. Horizons builds it from the US Space Force's Space-Track
-                         TLEs from launch to 30 days after the latest one. Outside that range (or if Horizons cannot be
-                         reached) an ideal sun-synchronous orbit with the official orbital parameters is used instead
-                         (IPAC SPHEREx Explanatory Supplement, Table 1); the position along the orbit is then unknown.
-    Stars                ESA Hipparcos (static/sky.json, built by tools/build_sky.py).
+    SPHEREx trajectory   NASA/JPL Horizons, spacecraft -163182, built from the US Space Force's Space-Track TLEs, from
+                         launch to 30 days after the latest one. Outside that range (or if Horizons cannot be reached) an
+                         ideal sun-synchronous orbit with the official parameters is used instead (IPAC SPHEREx Explanatory
+                         Supplement, Table 1); the position along the orbit is then unknown.
+    Small bodies         NASA/JPL SBDB (lookups) and SB Ident (what is inside a patch of sky). The built-in list of ~12,700
+                         objects is static/small_bodies.json (tools/build_small_bodies.py).
+    Stars                ESA Hipparcos (static/sky.json, tools/build_sky.py); test targets from ESA Gaia DR3
+                         (static/targets.json, tools/build_targets.py).
+
+Pages
+    /                               the viewer (templates/index.html + static/css, static/js)
+    /about                          about the project
+    anything else                   404 page (JSON for /api/... paths)
 
 API
-    /api/meta                       dates, coverage, sources
-    /api/track?jd0=&step=&n=        planet and Moon positions on a regular time grid
-    /api/spherex?jd=                SPHEREx orbit snapshot (position, orbit plane, period) at one instant
-    /api/orbits?jd=                 closed planet orbit paths centred on that instant
+    /api/meta                       dates, ephemeris coverage, sources
+    /api/track?jd0=&step=&n=        planet and Moon positions on a regular time grid (DE440s)
+    /api/orbits?jd=                 closed planet orbit paths centred on that instant (DE440s)
+    /api/spherex?jd=                SPHEREx orbit at one instant, plus its real track for the hour either side (Horizons)
+    /api/sbdb/lookup?q=             one asteroid or comet by name or number, with today's osculating elements
+    /api/sbident?ra=&dec=&jd=&hw=   known asteroids and comets inside a box of sky at a given time
 """
 import datetime as dt
 import math
+import os
 import re
 import threading
 import time
@@ -28,7 +39,7 @@ import warnings
 
 import numpy as np
 import requests
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, url_for
 
 ASTRO = False
 try:
@@ -43,6 +54,17 @@ except ImportError:
     pass
 
 app = Flask(__name__)
+
+
+@app.context_processor
+def _asset_urls():
+    """asset('js/core.js') -> /static/js/core.js?v=<file time>: browsers fetch a file again whenever it changes, so an
+    update never runs with stale cached JavaScript or CSS."""
+    def asset(path):
+        full = os.path.join(app.static_folder, path)
+        version = int(os.path.getmtime(full)) if os.path.exists(full) else 0
+        return f"{url_for('static', filename=path)}?v={version}"
+    return {"asset": asset}
 
 AU_KM = 149_597_870.7
 EARTH_R_KM = 6371.0
@@ -73,6 +95,42 @@ HORIZONS_AHEAD_DAYS = 28.0                       # stay safely inside "+30 d"
 
 def now_jd():
     return time.time() / 86400.0 + 2440587.5
+
+
+# --------------------------------------------------------- NASA/JPL web services ---
+HORIZONS_API = "https://ssd.jpl.nasa.gov/api/horizons.api"      # spacecraft and small-body positions, elements
+SBDB_API = "https://ssd-api.jpl.nasa.gov/sbdb.api"              # one small body by name or number
+SBIDENT_API = "https://ssd-api.jpl.nasa.gov/sb_ident.api"       # known small bodies inside a patch of sky
+_http = requests.Session()                                       # one connection pool for all JPL requests
+
+
+def jpl_get(url, params, attempts=1, timeout=30, as_json=False):
+    """GET a NASA/JPL API and return its text (or parsed JSON). Retries `attempts` times, 1.5 s apart, because JPL
+    occasionally answers with an error page; raises the last error if every attempt fails."""
+    last = None
+    for attempt in range(attempts):
+        try:
+            response = _http.get(url, params=params, timeout=timeout)
+            return response.json() if as_json else response.text
+        except Exception as exc:                                     # network error, or an error page instead of JSON
+            last = exc
+            if attempt + 1 < attempts:
+                time.sleep(1.5)
+    raise last
+
+
+def horizons_rows(text):
+    """The CSV rows of a Horizons answer (between $$SOE and $$EOE), each split into stripped fields."""
+    i, j = text.index("$$SOE"), text.index("$$EOE")
+    return [[f.strip() for f in line.split(",")] for line in text[i + 5:j].strip().splitlines()]
+
+
+def _num(x):
+    """float(x), or None for missing / non-numeric values (JPL sends numbers as strings, sometimes empty)."""
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
 
 
 # ------------------------------------------------------------------ JPL DE440s ---
@@ -172,23 +230,17 @@ def horizons_spherex(jd):
     params = {"format": "text", "COMMAND": f"'{HORIZONS_ID}'", "OBJ_DATA": "'NO'", "MAKE_EPHEM": "'YES'", "EPHEM_TYPE": "'VECTORS'",
               "CENTER": "'500@399'", "TLIST": f"'{key / 1440.0:.9f}'", "TLIST_TYPE": "'JD'", "TIME_TYPE": "'UT'",
               "REF_PLANE": "'ECLIPTIC'", "REF_SYSTEM": "'ICRF'", "OUT_UNITS": "'KM-S'", "VEC_TABLE": "'2'", "CSV_FORMAT": "'YES'"}
-    last = None
-    for attempt in range(3):
-        try:
-            txt = requests.get("https://ssd.jpl.nasa.gov/api/horizons.api", params=params, timeout=30).text
-            i, j = txt.index("$$SOE"), txt.index("$$EOE")
-            row = txt[i + 5:j].strip().split(",")
-            st = np.array([float(x) for x in row[2:8]])
-            if len(_hz_cache) > 5000:
-                _hz_cache.clear()
-            _hz_cache[key] = (st[:3], st[3:])
-            return _hz_cache[key]
-        except Exception as exc:
-            last = exc
-            time.sleep(1.5)
-    _hz_fail["until"] = time.time() + 60                            # back off for a minute, use the model meanwhile
-    print(f"[SPHEREx] Horizons unavailable ({last!s:.80}); using the orbit model for a minute")
-    return None
+    try:
+        row = horizons_rows(jpl_get(HORIZONS_API, params, attempts=3))[0]
+        st = np.array([float(x) for x in row[2:8]])
+    except Exception as exc:
+        _hz_fail["until"] = time.time() + 60                        # back off for a minute, use the model meanwhile
+        print(f"[SPHEREx] Horizons unavailable ({exc!s:.80}); using the orbit model for a minute")
+        return None
+    if len(_hz_cache) > 5000:
+        _hz_cache.clear()
+    _hz_cache[key] = (st[:3], st[3:])
+    return _hz_cache[key]
 
 
 _track_cache = {}
@@ -208,11 +260,9 @@ def horizons_spherex_track(jd):
               "CENTER": "'500@399'", "START_TIME": f"'JD {start:.9f}'", "STOP_TIME": f"'JD {start + 61 / 720:.9f}'", "STEP_SIZE": "'2m'",
               "TIME_TYPE": "'UT'", "REF_PLANE": "'ECLIPTIC'", "REF_SYSTEM": "'ICRF'", "OUT_UNITS": "'KM-S'", "VEC_TABLE": "'1'", "CSV_FORMAT": "'YES'"}
     try:
-        txt = requests.get("https://ssd.jpl.nasa.gov/api/horizons.api", params=params, timeout=30).text
-        i, j = txt.index("$$SOE"), txt.index("$$EOE")
-        rows = [ln.split(",") for ln in txt[i + 5:j].strip().splitlines()]
+        rows = horizons_rows(jpl_get(HORIZONS_API, params))
         out = [[float(r[0]), round(float(r[2]), 3), round(float(r[3]), 3), round(float(r[4]), 3)] for r in rows]
-    except Exception:
+    except Exception:                                               # the viewer falls back to the snapshot's circle
         return None
     if len(_track_cache) > 2000:
         _track_cache.clear()
@@ -349,29 +399,18 @@ def orbits():
 
 
 # ------------------------------------------------------------- object lookup (any JPL small body) ---
-SBDB_API = "https://ssd-api.jpl.nasa.gov/sbdb.api"
 _lookup_cache = {}
-
-
-def _num(x):
-    try:
-        return float(x)
-    except (TypeError, ValueError):
-        return None
 
 
 def horizons_elements(des, kind):
     """Heliocentric ecliptic J2000 osculating elements of a small body at the current time, from NASA/JPL Horizons."""
     cmd = f"{des};" if kind[1:2] == "n" and str(des).isdigit() else f"DES={des};" + (" CAP;" if kind.startswith("c") else "")
     try:
-        t = requests.get("https://ssd.jpl.nasa.gov/api/horizons.api", timeout=30, params={
+        t = jpl_get(HORIZONS_API, {
             "format": "text", "COMMAND": f"'{cmd}'", "EPHEM_TYPE": "ELEMENTS", "CENTER": "'500@10'", "REF_PLANE": "ECLIPTIC",
-            "TLIST": f"{now_jd():.5f}", "TLIST_TYPE": "JD", "TIME_TYPE": "TDB", "CSV_FORMAT": "YES", "OUT_UNITS": "AU-D"}).text
-        head = re.search(r"^\s*JDTDB,.*$", t, re.M).group(0)
-        body = re.search(r"\$\$SOE\s*(.*?)\$\$EOE", t, re.S).group(1).strip().splitlines()[0]
-        cols = [c.strip() for c in head.split(",")]
-        vals = [v.strip() for v in body.split(",")]
-        el = {c: float(v) for c, v in zip(cols, vals) if c and c != "Calendar Date (TDB)"}
+            "TLIST": f"{now_jd():.5f}", "TLIST_TYPE": "JD", "TIME_TYPE": "TDB", "CSV_FORMAT": "YES", "OUT_UNITS": "AU-D"})
+        cols = [c.strip() for c in re.search(r"^\s*JDTDB,.*$", t, re.M).group(0).split(",")]     # column names
+        el = {c: float(v) for c, v in zip(cols, horizons_rows(t)[0]) if c and c != "Calendar Date (TDB)"}
         return el if el.get("EC", 1) < 1 and el.get("A", -1) > 0 else None
     except Exception:
         return None
@@ -387,8 +426,7 @@ def sbdb_lookup():
     if q.lower() in _lookup_cache:
         return jsonify(_lookup_cache[q.lower()])
     try:
-        r = requests.get(SBDB_API, params={"sstr": q, "phys-par": "1", "full-prec": "1"}, timeout=25)
-        d = r.json()
+        d = jpl_get(SBDB_API, {"sstr": q, "phys-par": "1", "full-prec": "1"}, timeout=25, as_json=True)
     except Exception as e:                                   # network problem: say so, the viewer keeps working
         return jsonify({"error": f"NASA/JPL SBDB did not answer ({type(e).__name__})"}), 502
     if str(d.get("code")) == "300":
@@ -428,7 +466,6 @@ def sbdb_lookup():
 
 
 # ------------------------------------------- known asteroids and comets inside a patch of sky (JPL SB Ident) ---
-SBIDENT_API = "https://ssd-api.jpl.nasa.gov/sb_ident.api"
 _ident_cache = {}
 
 
@@ -459,15 +496,9 @@ def sbident():
         return jsonify(_ident_cache[key])
     params = {"mag-required": "true", "req-elem": "false", "mpc-code": "500", "obs-time": t.strftime("%Y-%m-%d_%H:%M:%S"),
               "fov-ra-center": _sexa(ra, True), "fov-dec-center": _sexa(dec, False), "fov-ra-hwidth": f"{hw:.4f}", "fov-dec-hwidth": f"{hw:.4f}"}
-    d, err = None, None
-    for attempt in range(3):                                   # JPL occasionally answers with an error page: try up to 3 times
-        try:
-            d = requests.get(SBIDENT_API, timeout=45, params=params).json()
-            break
-        except Exception as e:
-            err = e
-            time.sleep(1.5)
-    if d is None:
+    try:
+        d = jpl_get(SBIDENT_API, params, attempts=3, timeout=45, as_json=True)
+    except Exception as err:
         return jsonify({"error": f"NASA/JPL SB Ident did not answer ({type(err).__name__})"}), 502
     if "fields_first" not in d:
         return jsonify({"error": d.get("message", "no answer")}), 502
@@ -509,7 +540,12 @@ def sbident():
     return jsonify(out)
 
 
+def main(port=5000):
+    """Start the development server. The ephemeris loads in the background (the first run downloads 32 MB)."""
+    print(f"XARVIS running: viewer http://127.0.0.1:{port}/  ·  about page http://127.0.0.1:{port}/about")
+    threading.Thread(target=load_ephemeris, daemon=True).start()
+    app.run(debug=True, use_reloader=False, port=port)
+
+
 if __name__ == "__main__":
-    print("XARVIS running: viewer http://127.0.0.1:5000/  ·  about page http://127.0.0.1:5000/about")
-    threading.Thread(target=load_ephemeris, daemon=True).start()       # the first run downloads the 32 MB kernel
-    app.run(debug=True, use_reloader=False, port=5000)
+    main()

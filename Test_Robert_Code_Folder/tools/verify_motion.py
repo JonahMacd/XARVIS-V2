@@ -9,6 +9,7 @@ import json
 import math
 import os
 import sys
+import time
 import warnings
 
 import numpy as np
@@ -201,8 +202,19 @@ def two_body(el, jd_):
     return a * (math.cos(E) - e) * P + a * math.sqrt(1 - e * e) * math.sin(E) * Q
 
 
+def _retry(get, attempts=3):
+    """JPL occasionally answers with an error page: try a few times before giving up (as app.py does)."""
+    for attempt in range(attempts):
+        try:
+            return get()
+        except Exception:
+            if attempt + 1 == attempts:
+                raise
+            time.sleep(2)
+
+
 def sbdb_elements(des):
-    r = requests.get("https://ssd-api.jpl.nasa.gov/sbdb.api", params={"sstr": des, "full-prec": "1"}, timeout=60).json()
+    r = _retry(lambda: requests.get("https://ssd-api.jpl.nasa.gov/sbdb.api", params={"sstr": des, "full-prec": "1"}, timeout=60).json())
     el = {x["name"]: float(x["value"]) for x in r["orbit"]["elements"]}
     return [el["a"], el["e"], el["i"], el["om"], el["w"], el["ma"], float(r["orbit"]["epoch"])], r["object"]["fullname"].strip()
 
@@ -210,13 +222,12 @@ def sbdb_elements(des):
 def horizons_helio(des, jd_):
     p = {"format": "text", "COMMAND": f"'{des};'", "OBJ_DATA": "'NO'", "MAKE_EPHEM": "'YES'", "EPHEM_TYPE": "'VECTORS'", "CENTER": "'500@10'",
          "TLIST": f"'{jd_:.6f}'", "TLIST_TYPE": "'JD'", "TIME_TYPE": "'TDB'", "REF_PLANE": "'ECLIPTIC'", "REF_SYSTEM": "'ICRF'", "OUT_UNITS": "'AU-D'", "VEC_TABLE": "'1'", "CSV_FORMAT": "'YES'"}
-    t = requests.get("https://ssd.jpl.nasa.gov/api/horizons.api", params=p, timeout=60).text
+    t = _retry(lambda: requests.get("https://ssd.jpl.nasa.gov/api/horizons.api", params=p, timeout=60).text)
     row = t[t.index("$$SOE") + 5:t.index("$$EOE")].strip().split(",")
     return np.array([float(x) for x in row[2:5]])
 
 
 try:
-    import requests
     for des, kind in [("1", "main-belt"), ("4", "main-belt"), ("624", "Jupiter Trojan"), ("588", "Jupiter Trojan"), ("136199", "Kuiper-belt/scattered")]:
         el, name = sbdb_elements(des)
         out = []

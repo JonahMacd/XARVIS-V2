@@ -1,5 +1,8 @@
 """XARVIS test script: query IRSA for SPHEREx spectral images and inspect one.
 
+Stand-alone (the website does not use it). In the team repo the same IRSA access, with retries and caching, lives in
+the analysis pipeline's irsa.py.
+
 Based on the IRSA "Introduction to SPHEREx Spectral Images" tutorial, with:
   - retry loops so a temporary IRSA outage (502 etc.) doesn't kill the script
   - the missing fits.open step restored (hdulist)
