@@ -46,16 +46,24 @@ def make_zooms(frames, zoom_only):
 
 def parse_coords(coords):
     """A sky position from '08h55m10.8s -07d14m42s', '08:55:10.8 -07:14:42', '133.795 -7.245' or (ra, dec) in
-    degrees."""
+    degrees - or that pair written as text, '(133.795, -7.245)': how a results file stores a position that was
+    given as numbers (without this, such a target could not be re-run from the known-objects list)."""
     if isinstance(coords, SkyCoord):
         return coords
     if not isinstance(coords, str):
         ra, dec = coords
         return SkyCoord(float(ra), float(dec), unit='deg')
-    text = coords.strip().replace(',', ' ')
+    text = coords.strip().strip('()[]').replace(',', ' ')
     if any(c in text for c in 'hms:') or len(text.split()) == 6:      # sexagesimal: RA in hours
         return SkyCoord(text, unit=(u.hourangle, u.deg))
     return SkyCoord(text, unit='deg')
+
+
+def coords_name(coord):
+    """The name of a sky position as a target ('RA 08:55:10.8 Dec -07:14:43') - also its results file's name, so
+    it tells which saved results belong to a position."""
+    return (f"RA {coord.ra.to_string(u.hourangle, sep=':', precision=1, pad=True)} "
+            f"Dec {coord.dec.to_string(sep=':', precision=0, alwayssign=True, pad=True)}")
 
 
 def run(ra_deg=cfg.RA_DEG, dec_deg=cfg.DEC_DEG, max_images=cfg.MAX_IMAGES, show=True, zoom_only=cfg.ZOOM_ONLY,
@@ -98,7 +106,7 @@ def run_coords(coords=cfg.COORDS, max_images=cfg.MAX_IMAGES, show=True, zoom_onl
     there is measured in every frame, anything that moves away from it or changes brightness is flagged, and the
     whole field around it is compared with Gaia DR3 / CatWISE (what's known there) and JPL (known asteroids)."""
     coord = parse_coords(coords)
-    name = f"RA {coord.ra.to_string(u.hourangle, sep=':', precision=1, pad=True)} Dec {coord.dec.to_string(sep=':', precision=0, alwayssign=True, pad=True)}"
+    name = coords_name(coord)
     magnitudes = {}
     try:                                                       # 2MASS brightness of whatever is there (spectrum check)
         twomass = query_catalog(coord, 'fp_psc', 3 * u.arcsec)

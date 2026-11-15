@@ -348,11 +348,34 @@ def map_frames(frames, catalog, bodies, planets):
         found_here = []
         for k in np.flatnonzero(~result['matched'] & ~used):
             x, y = result['peak_x'][k], result['peak_y'][k]
+            if not (NEW_EDGE_PIX <= x <= nx - 1 - NEW_EDGE_PIX and NEW_EDGE_PIX <= y <= ny - 1 - NEW_EDGE_PIX):
+                # a source cut by the edge can't be checked (shape, neighbours, other arm, forced photometry): never
+                # NEW - but shown for what it is (measured: such peaks made 'NEW' objects that weren't there)
+                clean = result['peak_clean'][k]
+                if not clean and _real_source(frame, x, y) is None:     # flagged pixels, not shaped like a source
+                    flags = _artifact_flags(frame, x, y)
+                    entries.append({'kind': 'artifact', 'label': 'artifact: ' + (', '.join(flags[:2]) or 'flagged pixels'),
+                                    'ra': float(result['peak_ra'][k]), 'dec': float(result['peak_dec'][k]),
+                                    'detected': True})
+                elif not clean or result['peak_sigma'][k] >= cfg.FIELD_MIN_SIGMA:
+                    entries.append({'kind': 'edge', 'label': 'edge source (unchecked)', 'detected': True,
+                                    'ra': float(result['peak_ra'][k]), 'dec': float(result['peak_dec'][k]),
+                                    'info': 'a source at the edge of the image, in no catalog here: too close to the '
+                                            'edge to check whether it is real'})
+                continue
             if not result['peak_clean'][k]:
                 flags = _artifact_flags(frame, x, y)
                 source = _real_source(frame, x, y)
                 if source is not None:                    # flagged pixels nearby, but shaped like a real source
                     mra, mdec, msigma, mover_flags = source
+                    sx, sy = (float(v) for v in frame['wcs'].world_to_pixel_values(mra, mdec))
+                    if not (NEW_EDGE_PIX <= sx <= nx - 1 - NEW_EDGE_PIX and NEW_EDGE_PIX <= sy <= ny - 1 - NEW_EDGE_PIX):
+                        # (re-centred onto the edge: measured, a catalog star 1 px from the edge became 'NEW')
+                        entries.append({'kind': 'edge', 'label': 'edge source (unchecked)', 'detected': True,
+                                        'ra': mra, 'dec': mdec,
+                                        'info': 'a source at the edge of the image: too close to the edge to check '
+                                                'whether it is real'})
+                        continue
                     if all(np.hypot((mra - r) * np.cos(np.radians(mdec)), mdec - d) * 3600 > cfg.FIELD_MATCH_PIX * cfg.PIXEL_ARCSEC
                            for r, d in found_here):
                         found_here.append((mra, mdec))
@@ -368,6 +391,7 @@ def map_frames(frames, catalog, bodies, planets):
     return unexplained
 
 
+NEW_EDGE_PIX = 3                # an unexplained peak closer than this to the image edge is never made a NEW object
 MOVER_FLAGS = {'OUTLIER', 'TRANSIENT'}      # what SPHEREx's pipeline puts on a source that moves during the exposure
 # light that LOOKS like a star but is a copy of another one (Explanatory Supplement): on the peak itself = artifact
 COPY_FLAGS = ('GHOST', 'GHOST_FPA', 'GHOST_EXT', 'CROSSTALK', 'PERSIST')
@@ -430,10 +454,121 @@ def _covering(frames, ra, dec, margin=2):
     return out
 
 
-def classify_new(frames, unexplained, checked=None):
+def stacked_significance(frames, indices, ra, dec, positions=None):
+    """Is there really a source at (ra, dec)? Its brightness is measured at that fixed position in EVERY frame of
+    `indices` (forced photometry: also where no peak was found), as signal-to-noise per frame, and the question is
+    whether those values sit consistently above zero: their median, against its standard error from their own
+    scatter (robust, and never taken as smaller than the error bars say), converted to Gaussian sigma through
+    Student's t (so a handful of frames is judged fairly). Done separately for the two detector arms, whose
+    wavelengths differ (a very red or very blue source may show in one arm only); returns the larger, or None if no
+    frame could be measured.
+
+    A chance alignment of noise peaks - in hundreds of frames with several threshold-level noise peaks each, a few
+    land on the same spot - has a median of ~0 there (measured: such 'static' NEW objects, seen in 2-3 of ~400
+    frames, are not confirmed); a real source is above zero in most frames, even where no peak was found (sources
+    planted at 4-20 sigma per frame in real frames: 15-170 sigma). A median ignores the odd unflagged cosmic ray.
+    (Empty-sky control apertures were tried as the yardstick instead: in crowded fields they land on stars and
+    rejected real sources.)
+    positions: {frame index: (ra, dec)} - a different place per frame (a moving object's path) instead of ra, dec."""
+    from scipy import stats
+    from .measure import aperture_flux, robust_scatter
+    margin = cfg.ANNULUS_PIX[1] + 0.5       # only where the whole background ring fits: a ring cut off by the edge
+    best = None                             # biases every frame the same way (measured: 'confirmed' edge objects)
+    for short in (True, False):
+        values = []
+        for i in indices:
+            frame = frames[i]
+            if (frame['detector'] <= 3) != short:
+                continue
+            x, y = (float(v) for v in frame['wcs'].world_to_pixel_values(*(positions[i] if positions else (ra, dec))))
+            ny, nx = frame['image'].shape
+            if not (margin <= x < nx - 1 - margin and margin <= y < ny - 1 - margin):
+                continue
+            flux, error, n_bad = aperture_flux(frame, x, y)
+            if not n_bad and np.isfinite(flux) and np.isfinite(error) and error > 0:
+                values.append(flux / error)
+        if len(values) < 2:
+            continue
+        values = np.array(values)
+        error = 1.2533 * max(robust_scatter(values), 1.0) / np.sqrt(len(values))    # standard error of a median
+        t = np.median(values) / error
+        significance = float(np.clip(stats.norm.isf(stats.t.sf(t, len(values) - 1)), -40, 40)) if t < 40 else float(t)
+        best = significance if best is None else max(best, significance)
+    return best
+
+
+def _mark_as_star(frames, detections, catalog, row):
+    """The sky map of each detection's frame: the catalog star `row` was detected there (see known_star_nearby)."""
+    for m in detections:
+        frame = frames[m['frame']]
+        entries = frame.setdefault('map', [])
+        if any(e.get('kind') == 'star' and e.get('catalog_row') == row and e.get('detected') for e in entries):
+            continue
+        entries[:] = [e for e in entries if not (e.get('kind') == 'star' and e.get('catalog_row') == row)]
+        ra, dec = field_positions(catalog[row:row + 1], frame['mjd'])
+        entries.append({'kind': 'star', 'source': str(catalog['source'][row]), 'label': str(catalog['label'][row]),
+                        'ra': float(ra[0]), 'dec': float(dec[0]), 'detected': True, 'named': bool(catalog['hip'][row]),
+                        'mag': float(catalog['mag'][row]), 'catalog_row': row})
+
+
+def known_star_nearby(frames, indices, ra, dec, catalog, detections=()):
+    """The catalog row of a known star that the unexplained detections at (ra, dec) really are - or None.
+    `indices`: the frames covering (ra, dec); `detections`: the object's detections ({'frame': index, ...}).
+
+    In a crowded field two stars blend, and the peak of the blend can land more than FIELD_MATCH_PIX from both in
+    a few frames: then it looks unexplained there, although in the other frames it is matched to the star every
+    time (measured: 'static' NEW objects seen in 5-12 of 231 frames, at 30-140 sigma, all on a catalog star). So:
+      - within NEW_BLEND_PIX: a star SPHEREx detects in most of the covering frames. An unknown source that close
+        to a known star couldn't be told apart from it anyway (2.5 SPHEREx pixels = 15").
+      - within twice that: only a star SPHEREx detects in nearly every other covering frame (3 in 4) but in NONE of
+        the frames where the object appeared - the star itself, pushed off (measured: a 2000-sigma star whose core
+        pixels were masked appeared 2.6 px from its catalog position, as a 'NEW' object, in exactly the two frames
+        it was 'missing' from). Where the star is seen next to the object, the object is something else and stays;
+        a faint star seen only in some frames proves nothing (measured: with 'most' instead of 'none' / 'nearly
+        every', sources planted 4-5 px from faint stars were lost)."""
+    if catalog is None or not len(catalog) or not indices:
+        return None
+    ra_now, dec_now = field_positions(catalog, float(np.median([frames[i]['mjd'] for i in indices])))
+    separation = np.hypot(((ra_now - ra + 180) % 360 - 180) * np.cos(np.radians(dec)), dec_now - dec) * 3600
+    nearby = np.flatnonzero(separation <= 2 * cfg.NEW_BLEND_PIX * cfg.PIXEL_ARCSEC)
+    own = sorted({int(m['frame']) for m in detections})
+
+    def detected_in(row, frame_indices):
+        return sum(any(e.get('kind') == 'star' and e.get('catalog_row') == int(row) and e.get('detected')
+                       for e in frames[i].get('map', [])) for i in frame_indices)
+
+    object_sigma = []                           # (worked out once, when needed)
+    for row in nearby[np.argsort(separation[nearby])]:
+        if separation[row] <= cfg.NEW_BLEND_PIX * cfg.PIXEL_ARCSEC:
+            # a star SPHEREx sees there: as single peaks in most frames, or - a faint one - in the frames combined
+            # (measured: a 'NEW' object 1.7 px from a W1 = 15.8 CatWISE star, which the deep stack shows plainly
+            # but only some single frames detect). Combined, it must also be about as bright at its own position as
+            # at the object's: a bright source beside a faint star puts some of its light in the star's aperture
+            # too, but much less (measured: sources planted 2.6 px from faint stars were relabelled as them)
+            if detected_in(row, indices) >= 0.5 * len(indices):
+                return int(row)
+            star_sigma = stacked_significance(frames, indices, float(ra_now[row]), float(dec_now[row])) or 0
+            if star_sigma >= cfg.NEW_CONFIRM_SIGMA:
+                if not object_sigma:
+                    object_sigma.append(stacked_significance(frames, indices, ra, dec) or 0)
+                if star_sigma >= 0.5 * object_sigma[0]:
+                    return int(row)
+            continue
+        others = [i for i in indices if i not in set(own)]
+        if own and others and detected_in(row, own) == 0 and detected_in(row, others) >= 0.75 * len(others):
+            return int(row)
+    return None
+
+
+def classify_new(frames, unexplained, checked=None, catalog=None):
     """Group the unexplained detections into objects and decide what each is (static / variable / transient /
     moving / single - see the module description). Returns a list of new-object dicts (id, kind, description,
-    ra, dec, detections [...], track) and adds a 'new' entry to frame['map'] for every detection."""
+    ra, dec, detections [...], track) and adds a 'new' entry to frame['map'] for every detection.
+
+    Before anything is called new, it must hold up over ALL the frames (see stacked_significance and
+    known_star_nearby): an object seen at a fixed place must stand out by NEW_CONFIRM_SIGMA when every frame of the
+    visits it was seen in is combined, and must not be a catalog star that blending pushed off its position
+    (`catalog`: the star catalog, catalog_layer). Each new object gets 'confirmed_sigma'."""
     if not unexplained:
         return []
     mjd = np.array([f['mjd'] for f in frames])
@@ -470,6 +605,52 @@ def classify_new(frames, unexplained, checked=None):
                         'visits_seen': seen_visits, 'visits_covered': covered_visits, 'depth': depth})
     objects += _link_movers(singles, frames, visit)
     linked = {id(m) for o in objects if o['kind'] == 'moving' for m in o['detections']}
+    rejected = {'noise': 0, 'blend': 0}
+    confirmed = []
+    for obj in objects:                     # does it hold up over all the frames?
+        if obj['kind'] == 'moving':
+            # along its fitted path, in the OTHER frames of its visit (the ones that made it can't confirm it):
+            # three noise peaks that happen to line up have nothing there (measured: such a 'mover', 5-8 sigma
+            # peaks, one on a bright star's wing); a real one does. Can't be checked (no other frame): kept.
+            own = {m['frame'] for m in obj['detections']}
+            t0, t1 = obj['fit']['mjd'].min() - 0.5, obj['fit']['mjd'].max() + 0.5
+            others = [i for i in range(len(frames)) if i not in own and visit[i] == obj['visits_seen'][0]
+                      and t0 <= frames[i]['mjd'] <= t1]
+            path = {i: tuple(float(v) for v in _linear(obj['fit'], frames[i]['mjd'])) for i in others}
+            sigma = stacked_significance(frames, others, None, None, positions=path) if others else None
+            if sigma is not None and sigma < cfg.NEW_CONFIRM_SIGMA:
+                rejected['noise'] += 1
+                continue
+            obj['confirmed_sigma'] = sigma
+            confirmed.append(obj)
+            continue
+        covered = _covering(frames, obj['ra'], obj['dec'])
+        star = known_star_nearby(frames, covered, obj['ra'], obj['dec'], catalog, obj['detections'])
+        if star is not None:
+            _mark_as_star(frames, obj['detections'], catalog, star)
+            rejected['blend'] += 1
+            continue
+        seen = set(obj['visits_seen'])
+        sigma = stacked_significance(frames, [i for i in covered if visit[i] in seen], obj['ra'], obj['dec'])
+        if sigma is None or sigma < cfg.NEW_CONFIRM_SIGMA:
+            rejected['noise'] += 1
+            continue
+        obj['confirmed_sigma'] = sigma
+        confirmed.append(obj)
+    # fragments: a faint source's noisier detections can land just outside the grouping radius and form objects of
+    # their own, which then 'confirm' on its light (measured: two such beside a real faint source). Within
+    # NEW_BLEND_PIX of an object with more detections, they are that object.
+    objects, rejected['fragment'] = [], 0
+    for obj in sorted(confirmed, key=lambda o: -len(o['detections'])):
+        host = None if obj['kind'] == 'moving' else next(
+            (h for h in objects if h['kind'] != 'moving' and np.hypot(
+                ((h['ra'] - obj['ra'] + 180) % 360 - 180) * np.cos(np.radians(obj['dec'])), h['dec'] - obj['dec']) * 3600
+             <= cfg.NEW_BLEND_PIX * cfg.PIXEL_ARCSEC), None)
+        if host is None:
+            objects.append(obj)
+        else:
+            host['detections'] = host['detections'] + obj['detections']
+            rejected['fragment'] += 1
     group_of = {id(det[k]): int(group[k]) for k in range(len(det))}
     leftovers = {}                                                # seen at one instant: per place (both arms together)
     for m in singles:
@@ -479,6 +660,12 @@ def classify_new(frames, unexplained, checked=None):
     for members in leftovers.values():
         best = max(members, key=lambda m: m['sigma'])
         if best['sigma'] < cfg.FIELD_MIN_SIGMA + 2:               # one faint peak at one instant: most likely noise
+            continue
+        star = known_star_nearby(frames, _covering(frames, best['ra'], best['dec']), best['ra'], best['dec'], catalog,
+                                 members)
+        if star is not None:                                      # a catalog star, pushed off by blending
+            _mark_as_star(frames, members, catalog, star)
+            rejected['blend'] += 1
             continue
         arms = {frames[m['frame']]['detector'] <= 3 for m in members}
         if len(arms) == 1:
@@ -496,6 +683,14 @@ def classify_new(frames, unexplained, checked=None):
     if glitches:
         log.info(f'  ({glitches} one-instant detection(s) dropped as probable cosmic rays: seen by one detector arm only, '
               f'while the other arm imaged the same spot at the same instant and saw nothing)')
+    if rejected['noise']:
+        log.info(f"  ({rejected['noise']} candidate(s) dropped as chance alignments of noise: all the frames of the "
+                 f"visits they were seen in, combined, show nothing there (< {cfg.NEW_CONFIRM_SIGMA} sigma))")
+    if rejected['blend']:
+        log.info(f"  ({rejected['blend']} candidate(s) dropped as a catalog star right there (within "
+                 f"{cfg.NEW_BLEND_PIX} px), whose peak blending or masked pixels pushed off its position)")
+    if rejected['fragment']:
+        log.info(f"  ({rejected['fragment']} candidate(s) merged into a NEW object next to them: the same source)")
     for obj in objects:
         obj['jpl_checked'] = all(m['frame'] in (checked or ()) for m in obj['detections'])
 
@@ -613,6 +808,13 @@ def _link_movers(singles, frames, visit):
 
 
 def _describe(obj):
+    text = _describe_kind(obj)
+    if obj.get('confirmed_sigma') is not None:
+        text += f"; confirmed over all frames of those visits: {obj['confirmed_sigma']:.0f} sigma"
+    return text
+
+
+def _describe_kind(obj):
     n = len(obj['detections'])
     times = len(np.unique(np.round([m['mjd'] for m in obj['detections']], 3)))
     known = ('not a known asteroid or comet (JPL SB Ident)' if obj.get('jpl_checked') else
@@ -665,7 +867,7 @@ def map_sky(frames, coord):
     bodies, checked = small_bodies(frames, coord, radius, priority={u_[0] for u_ in unexplained})
     if bodies:
         unexplained = map_frames(frames, catalog, bodies, planets)
-    new = classify_new(frames, unexplained, checked)
+    new = classify_new(frames, unexplained, checked, catalog)
     if new:
         kinds = {}
         for o in new:

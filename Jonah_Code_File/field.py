@@ -28,9 +28,11 @@ from astropy.time import Time
 from . import config as cfg
 from . import net
 from .irsa import gator
-from .measure import centroid, significant_peaks, survey_visits
+from .measure import centroid, saturated_cores, saturated_spill, significant_peaks, survey_visits
 
 log = logging.getLogger(__name__)
+
+SATURATED_WING_PIX = 3              # peaks this far beyond a saturated core's edge are its wings, not other sources
 
 GAIA_EPOCH_MJD = 57388.0            # Gaia DR3 positions are for 2016.0
 CATWISE_EPOCH_MJD = 57170.0         # CatWISE2020: ~2015.4
@@ -142,8 +144,17 @@ def describe_target(field, coord, mjd):
 def compare_frame(frame, field):
     """Match the source peaks SPHEREx detects in `frame` (a frame or a zoom: needs 'image', 'bad', 'wcs', 'mjd')
     to the field catalog at the frame's date.
-    Returns {'peak_x', 'peak_y', 'peak_sigma', 'peak_ra', 'peak_dec', 'matched' (per peak), 'cat_x', 'cat_y',
-    'cat_source', 'cat_gaia_match', 'offset_px' (per matched Gaia peak: measured - catalog, x/y)}."""
+    Returns {'peak_x', 'peak_y', 'peak_sigma', 'peak_ra', 'peak_dec', 'matched' (per peak), 'peak_saturated' (per
+    peak: a saturated star, see below), 'cat_x', 'cat_y', 'cat_source', 'cat_gaia_match', 'offset_px' (per matched
+    Gaia peak: measured - catalog, x/y)}.
+
+    A saturated star (measure.saturated_cores) is ONE source at the centre of its masked core: the peaks found in
+    and around the core - the rim of the mask, the bright wings - are dropped (measured on a field with a
+    saturated target: hundreds of such peaks, reported as artifacts, unexplained or even NEW). It matches a catalog
+    star within FIELD_MATCH_PIX plus the core's radius (its centre is less precise than a peak's).
+    A CatWISE entry with a Gaia counterpart (gaia_match) is never matched to a peak: it is the same star as the
+    Gaia entry, which is matched instead (the sky map draws the Gaia entry; a peak matched to the CatWISE twin used
+    to be drawn as nothing at all)."""
     # every real source (instrument noise) is matched; 'peak_sigma' says how far each stands out from the crowd of
     # faint field stars (0 = not at all) - only those count as unexplained sources
     xs, ys, _ = significant_peaks(frame, noise='pixel')
@@ -153,6 +164,16 @@ def compare_frame(frame, field):
     ny, nx = frame['image'].shape
     edge = (xs >= 2) & (xs < nx - 2) & (ys >= 2) & (ys < ny - 2)          # half a PSF from the edge: unreliable
     xs, ys, significance = xs[edge], ys[edge], significance[edge]
+    cores = saturated_cores(frame)
+    if cores:                                       # each saturated star: one source instead of its many peaks
+        cx, cy, radius, core_sigma, _ = (np.array(values) for values in zip(*cores))
+        # (just past the core: the rim of the mask and the inner wings. Not the whole glow - measured: clearing that
+        # out to ~7 px also removed real sources sitting on it)
+        keep = np.all(np.hypot(xs[:, None] - cx[None, :], ys[:, None] - cy[None, :])
+                      > radius[None, :] + SATURATED_WING_PIX, axis=1)
+        xs, ys, significance = np.r_[xs[keep], cx], np.r_[ys[keep], cy], np.r_[significance[keep], core_sigma]
+    is_core = np.r_[np.zeros(len(xs) - len(cores), dtype=bool), np.ones(len(cores), dtype=bool)]
+    tolerance = cfg.FIELD_MATCH_PIX + np.r_[np.zeros(len(xs) - len(cores)), [core[2] for core in cores]]
     ra, dec = field_positions(field, frame['mjd'])
     cat_x, cat_y = frame['wcs'].world_to_pixel_values(ra, dec)
     inside = (cat_x > -3) & (cat_x < nx + 2) & (cat_y > -3) & (cat_y < ny + 2)
@@ -162,13 +183,24 @@ def compare_frame(frame, field):
     offsets = []
     if inside.any() and len(xs):
         d = np.hypot(xs[:, None] - cat_x[None, inside], ys[:, None] - cat_y[None, inside])
+        twin = (np.asarray(field['source'])[inside] == 'CatWISE') & np.asarray(field['gaia_match'])[inside]
+        d[:, twin] = np.inf                                  # (the same star as a Gaia entry: match that one)
         nearest = np.argmin(d, axis=1)
-        matched = d[np.arange(len(xs)), nearest] <= cfg.FIELD_MATCH_PIX
-        seen = (d <= cfg.FIELD_MATCH_PIX).any(axis=0)
+        matched = d[np.arange(len(xs)), nearest] <= tolerance
+        seen = (d <= tolerance[:, None]).any(axis=0)
         peak_cat[matched] = np.flatnonzero(inside)[nearest[matched]]
+        # an unmatched saturated patch that is only spill from a bigger, matched saturated star: that star
+        first = len(xs) - len(cores)
+        for k, small in enumerate(cores):
+            if matched[first + k]:
+                continue
+            for j, big in enumerate(cores):
+                if j != k and matched[first + j] and big[2] > small[2] and saturated_spill(frame, small, big):
+                    matched[first + k], peak_cat[first + k] = True, peak_cat[first + j]
+                    break
         is_gaia = np.asarray(field['source'])[inside] == 'Gaia'
         clean_image = np.where(frame['bad'], np.nan, frame['image'])
-        for i in np.flatnonzero(matched):
+        for i in np.flatnonzero(matched & ~is_core):
             j = nearest[i]
             if is_gaia[j] and significance[i] >= 10:     # well-measured sources only
                 c = centroid(clean_image, frame['variance'], xs[i], ys[i]) if 'variance' in frame else None
@@ -177,11 +209,12 @@ def compare_frame(frame, field):
     peak_ra, peak_dec = frame['wcs'].pixel_to_world_values(xs, ys) if len(xs) else (np.array([]), np.array([]))
     # clean = no flagged pixel within 2 px. Measured (WISE 0855 field): every "unexplained" peak next to a flagged
     # pixel was the leftover glow around a masked cosmic-ray hit / persistence / overflow - not a source.
+    # (A saturated star's own masked core doesn't make it an artifact.)
     bad = frame['bad']
-    clean = np.array([not bad[max(int(y) - 2, 0):int(y) + 3, max(int(x) - 2, 0):int(x) + 3].any()
-                      for x, y in zip(xs, ys)], dtype=bool)
+    clean = np.array([core or not bad[max(int(y) - 2, 0):int(y) + 3, max(int(x) - 2, 0):int(x) + 3].any()
+                      for x, y, core in zip(xs, ys, is_core)], dtype=bool)
     return {'peak_x': xs, 'peak_y': ys, 'peak_sigma': significance, 'peak_ra': np.atleast_1d(peak_ra),
-            'peak_dec': np.atleast_1d(peak_dec), 'matched': matched, 'peak_clean': clean,
+            'peak_dec': np.atleast_1d(peak_dec), 'matched': matched, 'peak_clean': clean, 'peak_saturated': is_core,
             'cat_x': cat_x[inside], 'cat_y': cat_y[inside], 'cat_source': np.asarray(field['source'])[inside],
             'cat_gaia_match': np.asarray(field['gaia_match'])[inside], 'cat_seen': seen, 'cat_index': np.flatnonzero(inside), 'peak_cat': peak_cat, 'offset_px': np.array(offsets).reshape(-1, 2)}
 

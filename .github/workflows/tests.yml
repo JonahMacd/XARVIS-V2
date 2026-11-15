@@ -1,0 +1,28 @@
+name: tests
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Install requirements
+        run: python -m pip install -r requirements.txt
+
+      - name: No merge-conflict markers
+        run: |
+          if git grep -n -E '^(<<<<<<<|>>>>>>>)( |$)|^=======$' -- '*.py' '*.json' '*.txt'; then
+            echo "::error::merge-conflict markers found (see above)"; exit 1
+          fi
+
+      - name: Every Python file compiles
+        run: python -m compileall -q Jonah_Code_File Test_Jonah_code.py
+
+      - name: Offline tests (synthetic data, no network)
+        run: python -m unittest discover -s Jonah_Code_File -p "test_*.py" -t .

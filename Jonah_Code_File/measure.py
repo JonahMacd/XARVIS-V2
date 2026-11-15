@@ -263,6 +263,92 @@ def significant_peaks(frame, noise='pixel'):
     return xs.astype(float), ys.astype(float), significance[ys, xs]
 
 
+SATURATED_CORE_FLAGS = {'OVERFLOW', 'BLOOM'}     # what SPHEREx puts on a star too bright for the detector
+SATURATED_RING_SIGMA = 5                          # the pixels just around a saturated core: this far above the sky
+
+
+def saturated_cores(frame):
+    """Every saturated star in the frame: a connected patch of masked pixels flagged OVERFLOW / BLOOM with BRIGHT
+    pixels all around it. (A cosmic-ray hit is masked too, but flagged TRANSIENT / OUTLIER and has empty sky
+    around it - measured on 5 fields: rings at ~0 sigma, against ~7 sigma around saturated cores.)
+    Peak-finding scatters many false peaks over such a star - inside its masked core and on the rim of the mask -
+    so field.compare_frame replaces them with ONE source per core.
+    Returns [(x, y, radius_px, significance, halo_px)]: the core's centre, its equivalent radius, how far its ring
+    stands above the sky (in units of the frame's pixel scatter), and how far out its glow stays SATURATED_RING_SIGMA
+    above the sky (median of each 1-px ring; bright stars' halos reach ~10 px - see GLOW_RING_PIX).
+    (A very bright star's mask can come in pieces - see saturated_spill.)"""
+    from scipy import ndimage
+    header = frame.get('flags_header')
+    if header is None or 'flags' not in frame:
+        return []
+    bits = flag_bits(header, SATURATED_CORE_FLAGS)
+    if not bits:
+        return []
+    labels, n = ndimage.label(frame['bad'])
+    if not n:
+        return []
+    image = frame['image']
+    good = ~frame['bad'] & np.isfinite(image)
+    sky, noise = np.median(image[good]), max(robust_scatter(image[good]), 1e-12)
+    saturated = (frame['flags'] & bits) != 0
+    cores = []
+    for k in np.unique(labels[saturated & (labels > 0)]):
+        region = labels == k
+        ring = ndimage.binary_dilation(region, iterations=2) & good & ~region
+        if ring.sum() < 3:
+            continue
+        significance = (np.median(image[ring]) - sky) / noise
+        if significance < SATURATED_RING_SIGMA:
+            continue
+        ys, xs = np.nonzero(region)
+        x, y, radius = float(xs.mean()), float(ys.mean()), float(np.sqrt(region.sum() / np.pi))
+        profile = _ring_profile(image, good, x, y) - sky
+        halo = radius
+        for r in range(int(np.ceil(radius)), len(profile)):     # out through the glow, ring by ring
+            if not profile[r] >= SATURATED_RING_SIGMA * noise:
+                break
+            halo = r + 1.0
+        cores.append((x, y, radius, float(significance), float(halo)))
+    return cores
+
+
+def _ring_profile(image, good, x, y, size=16):
+    """Median of the good pixels in each 1-px ring around (x, y), out to `size` px (NaN where too few)."""
+    yy, xx = np.indices(image.shape)
+    distance = np.hypot(xx - x, yy - y)
+    profile = np.full(size, np.nan)
+    for r in range(size):
+        ring = good & (distance >= r) & (distance < r + 1)
+        if ring.sum() >= 4:
+            profile[r] = np.median(image[ring])
+    return profile
+
+
+def saturated_spill(frame, small, big):
+    """Is the saturated patch `small` just spill from the bigger saturated star `big` (saturated_cores entries)?
+    A very bright star's mask can come in pieces - charge spilling out of the core (BLOOM / OVERFLOW) a few pixels
+    away (measured: such patches, 3-4 px from a mag-7.6 star, were reported as NEW objects). Spill sits on the star's
+    own glow: on the patch's OUTER side (away from the star, where the star's profile is measured) the light is no
+    more than that profile predicts. A real source there stands well above it (measured: a 2000-sigma transient 4.3 px
+    from a bright star - distance alone would have swallowed it)."""
+    image = frame['image']
+    good = ~frame['bad'] & np.isfinite(image)
+    sky, noise = np.median(image[good]), max(robust_scatter(image[good]), 1e-12)
+    separation = np.hypot(small[0] - big[0], small[1] - big[1])
+    if separation > max(big[2] + 3, big[4] + 1):
+        return False
+    yy, xx = np.indices(image.shape)
+    to_big = np.hypot(xx - big[0], yy - big[1])
+    near_small = np.hypot(xx - small[0], yy - small[1])
+    outer = good & (near_small >= small[2] + 0.5) & (near_small <= small[2] + 2.5) & (to_big >= separation)
+    profile = _ring_profile(image, good, big[0], big[1])
+    known = np.flatnonzero(np.isfinite(profile))
+    if outer.sum() < 3 or not len(known):
+        return False
+    expected = np.interp(to_big[outer] - 0.5, known, profile[known])
+    return bool(np.median(image[outer] - expected) < SATURATED_RING_SIGMA * noise)
+
+
 def locate_object(frame):
     """Where the object actually is in this frame, and whether we're sure it's the right one.
 

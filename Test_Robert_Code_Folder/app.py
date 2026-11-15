@@ -28,11 +28,15 @@ API
     /api/spherex?jd=                SPHEREx orbit at one instant, plus its real track for the hour either side (Horizons)
     /api/sbdb/lookup?q=             one asteroid or comet by name or number, with today's osculating elements
     /api/sbident?ra=&dec=&jd=&hw=   known asteroids and comets inside a box of sky at a given time
+    /api/analysis/...               the SPHEREx image analysis: the pipeline in ../Jonah_Code_File, connected below
+                                    (start an analysis, follow it, read its measurements, frame images and saved
+                                    results; every route is listed in Jonah_Code_File/web.py)
 """
 import datetime as dt
 import math
 import os
 import re
+import sys
 import threading
 import time
 import warnings
@@ -65,6 +69,26 @@ def _asset_urls():
         version = int(os.path.getmtime(full)) if os.path.exists(full) else 0
         return f"{url_for('static', filename=path)}?v={version}"
     return {"asset": asset}
+
+
+# ------------------------------------------------------ SPHEREx image analysis (pipeline) ---
+# The analysis pipeline is the package next to this folder, ../Jonah_Code_File. Its web bridge (web.py there) adds every
+# /api/analysis/... route to this app: the popup's requestAnalysis() and the "SPHEREx image analyses" panel use them
+# (static/js/pipeline.js). If the pipeline cannot be loaded - a package it needs is missing - the viewer still works and
+# /api/analysis/status says why.
+PIPELINE_ERROR = None
+try:
+    _project = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))      # the folder holding both code folders
+    if _project not in sys.path:
+        sys.path.append(_project)                                                # (last: it can't shadow anything)
+    from Jonah_Code_File.web import create_blueprint
+    app.register_blueprint(create_blueprint())
+except Exception as exc:
+    PIPELINE_ERROR = f"{type(exc).__name__}: {exc}"
+
+    @app.route("/api/analysis/status")
+    def analysis_unavailable():
+        return jsonify({"available": False, "error": PIPELINE_ERROR})
 
 AU_KM = 149_597_870.7
 EARTH_R_KM = 6371.0
@@ -543,6 +567,8 @@ def sbident():
 def main(port=5000):
     """Start the development server. The ephemeris loads in the background (the first run downloads 32 MB)."""
     print(f"XARVIS running: viewer http://127.0.0.1:{port}/  ·  about page http://127.0.0.1:{port}/about")
+    print("[analysis] SPHEREx image analysis connected (Jonah_Code_File)" if PIPELINE_ERROR is None else
+          f"[analysis] SPHEREx image analysis NOT available ({PIPELINE_ERROR:.200}); the viewer works without it")
     threading.Thread(target=load_ephemeris, daemon=True).start()
     app.run(debug=True, use_reloader=False, port=port)
 

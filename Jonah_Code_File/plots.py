@@ -360,7 +360,7 @@ def take_track_request():
 MAP_STYLE = {   # how each kind of mapped object is drawn (see skymap.py)
     'new': dict(color='#ffe600'), 'small body': dict(color='magenta'), 'planet': dict(color='#7CFC00'),
     'artifact': dict(color='0.6'), 'Gaia': dict(color='#4fd2ff'), 'CatWISE': dict(color='#ff9a3c'),
-    'Hipparcos': dict(color='white'),
+    'Hipparcos': dict(color='white'), 'edge': dict(color='#c8b46e'),
 }
 NEW_MARKER_SIZE = 420           # points^2: the ring around a NEW object
 
@@ -381,7 +381,9 @@ def map_legend():
             handle('planet / Moon (DE440s)', marker='D', markersize=7, markerfacecolor='none',
                    markeredgecolor=MAP_STYLE['planet']['color']),
             handle('flagged detector artifact', marker='s', markersize=7, markerfacecolor='none',
-                   markeredgecolor=MAP_STYLE['artifact']['color'])]
+                   markeredgecolor=MAP_STYLE['artifact']['color']),
+            handle('source at the image edge\n(unchecked)', marker='o', markersize=7, markerfacecolor='none',
+                   markeredgecolor=MAP_STYLE['edge']['color'])]
 
 
 def draw_map(ax, display, entries):
@@ -412,6 +414,8 @@ def draw_map(ax, display, entries):
                             fontsize=7, zorder=8)
         elif kind == 'artifact':
             style = ('artifact', color)
+        elif kind == 'edge':
+            style = ('edge', color)
         elif kind == 'new':                                 # not in ANY catalog: impossible to miss
             style = ('new', color)
             ax.annotate(entry['label'].replace(' (', '\n('), (x, y), xytext=(14, 10), textcoords='offset points',
@@ -434,6 +438,8 @@ def draw_map(ax, display, entries):
                        lw=0.9, zorder=5)
         elif style[0] == 'artifact':
             ax.scatter(px, py, marker='s', s=30, facecolor='none', edgecolor=style[1], lw=0.8, zorder=5)
+        elif style[0] == 'edge':
+            ax.scatter(px, py, marker='o', s=45, facecolor='none', edgecolor=style[1], lw=1.0, zorder=5)
         elif style[0] == 'new':     # (sizes in screen points, so it is just as visible in the wide view)
             ax.scatter(px, py, s=NEW_MARKER_SIZE * 2.2, facecolor='none', edgecolor=style[1], lw=7, alpha=0.25, zorder=7)
             ax.scatter(px, py, s=NEW_MARKER_SIZE, facecolor='none', edgecolor=style[1], lw=2.6, zorder=8)
@@ -443,7 +449,7 @@ def draw_map(ax, display, entries):
     ax.set_ylim(-0.5, ny - 0.5)
     parts = [f"{counts[k]} {label}" for k, label in (('Hipparcos', 'Hipparcos'), ('Gaia', 'Gaia DR3 (+)'),
              ('CatWISE', 'CatWISE (x)'), ('small body', 'known asteroid/comet'), ('planet', 'planet'),
-             ('artifact', 'flagged artifact'), ('new', 'NEW (yellow)')) if counts.get(k)]
+             ('artifact', 'flagged artifact'), ('edge', 'at the edge'), ('new', 'NEW (yellow)')) if counts.get(k)]
     return drawn, 'mapped: ' + (', '.join(parts) or 'nothing detected') + '   - click an object, T = track it'
 
 
@@ -482,6 +488,8 @@ def track_spec(entry, tracked, frame_mjd):
                 return obj['track']
     if kind == 'artifact':
         return {'kind': 'none', 'name': entry['label'], 'reason': 'a flagged detector artifact, not a source'}
+    if kind == 'edge':                                      # analysed where it is: away from this image's edge
+        return {'kind': 'coords', 'coords': (entry['ra'], entry['dec']), 'name': entry['label']}
     return {'kind': 'none', 'name': entry['label'], 'reason': 'planets are far too bright for SPHEREx to measure'}
 
 

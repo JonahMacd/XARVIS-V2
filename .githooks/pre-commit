@@ -1,0 +1,33 @@
+#!/bin/sh
+# Refuses a commit that would break the program: merge-conflict markers, Python files that don't compile, or an
+# invalid config.json. (A merge that left conflict markers in main.py once stopped the whole program from starting.)
+#
+# Turned on once per clone with:   git config core.hooksPath .githooks
+# Skip it for one commit (only if you're sure):   git commit --no-verify
+
+files=$(git diff --cached --name-only --diff-filter=ACM)
+[ -z "$files" ] && exit 0
+status=0
+for f in $files; do
+  [ -f "$f" ] || continue
+  case "$f" in
+    *.py|*.json|*.txt|*.md|*.yml)
+      if grep -n -E '^(<<<<<<<|>>>>>>>)( |$)|^=======$' "$f"; then
+        echo "pre-commit: merge-conflict markers left in $f (lines above) - resolve them first"
+        status=1
+      fi ;;
+  esac
+  case "$f" in
+    *.py)
+      if ! python -m py_compile "$f"; then
+        echo "pre-commit: $f does not compile"
+        status=1
+      fi ;;
+    *.json)
+      if ! python -c "import json, sys; json.load(open(sys.argv[1], encoding='utf-8'))" "$f"; then
+        echo "pre-commit: $f is not valid JSON"
+        status=1
+      fi ;;
+  esac
+done
+exit $status
