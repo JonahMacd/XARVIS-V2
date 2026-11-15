@@ -20,6 +20,7 @@ from .plots import LiveView, show_motion, show_spectrum, show_time_series, show_
 from .results import save_results
 from .stars import catalog_sed, contamination_check, position_at, positions_at, resolve_star
 from .target import find_tracked_object
+<<<<<<< HEAD
 
 MID_DATA_MJD = 61000.0          # ~2025-11, middle of the SPHEREx data so far: where to search for a moving star
 
@@ -31,6 +32,9 @@ def start_live_view(tracked, images, show):
         return None
     return LiveView(tracked, len(images), float(min(images['t_min'])))
 
+=======
+from .spectrumanalyser import SpectrumAnalyzer
+>>>>>>> 516ac70cad3f4855c78637eb3615c83afab0ab17
 
 def make_zooms(frames, zoom_only):
     """Original-pixel zoom of every frame, in order. zoom_only=True releases each frame's full-size pixel
