@@ -1,49 +1,43 @@
-"""XARVIS proof of concept: live solar-system model with SPHEREx's position.
+"""XARVIS: SPHEREx + solar system viewer (Flask backend). Official sources only.
 
 Run:  python app.py   then open http://127.0.0.1:5000
 
-Frame for everything sent to the browser: heliocentric ecliptic J2000, AU.
+Frame for everything sent to the browser: heliocentric ecliptic J2000, AU, times as Julian Dates (UTC).
 
-Planets, Sun, Moon
-    astropy's ephemeris (default 'builtin': ERFA epv00/plan94/moon98).
-    Planet *orbit paths* are traced from ephemeris positions over one full period,
-    not drawn as ideal ellipses. Set XARVIS_EPHEMERIS=de440s (needs `pip install jplephem`
-    and a one-off ~32 MB kernel download) for JPL DE440 accuracy.
-    If astropy is missing, falls back to Keplerian elements (Standish, ~arcminute).
+Data sources (all official)
+    Planets, Sun, Moon   NASA/JPL DE440s planetary ephemeris (NAIF SPK kernel, 1849-12-26 .. 2150-01-22), read through
+                         astropy + jplephem. Outside that range the browser uses JPL's published mean orbital elements.
+    SPHEREx trajectory   NASA/JPL Horizons, spacecraft -163182. Horizons builds it from the US Space Force's Space-Track
+                         TLEs from launch to 30 days after the latest one. Outside that range (or if Horizons cannot be
+                         reached) an ideal sun-synchronous orbit with the official orbital parameters is used instead
+                         (IPAC SPHEREx Explanatory Supplement, Table 1); the position along the orbit is then unknown.
+    Stars                ESA Hipparcos (static/sky.json, built by tools/build_sky.py).
 
-SPHEREx
-    Live TLE from CelesTrak, propagated with SGP4 (needs `pip install sgp4`), then rotated
-    TEME -> GCRS -> ecliptic with astropy (precession/nutation included).
-    Without a TLE it falls back to a physically correct sun-synchronous orbit
-    (inclination from the J2 sun-sync condition, 650 km, dawn-dusk plane that tracks the Sun)
-    but the position *along* the orbit is NOT known in that mode.
+API
+    /api/meta                       dates, coverage, sources
+    /api/track?jd0=&step=&n=        planet and Moon positions on a regular time grid
+    /api/spherex?jd=                SPHEREx orbit snapshot (position, orbit plane, period) at one instant
+    /api/orbits?jd=                 closed planet orbit paths centred on that instant
 """
 import datetime as dt
 import math
-import os
+import re
 import threading
 import time
-import urllib.request
 import warnings
 
 import numpy as np
-from flask import Flask, jsonify, render_template
-
-try:
-    from sgp4.api import Satrec
-except ImportError:
-    Satrec = None
+import requests
+from flask import Flask, jsonify, render_template, request
 
 ASTRO = False
 try:
     import astropy.units as u
     from astropy.time import Time
     from astropy.utils import iers
-    from astropy.coordinates import (CartesianRepresentation, GCRS, TEME,
-                                     get_body_barycentric, solar_system_ephemeris)
-    iers.conf.auto_download = False          # never block on a network fetch
-    iers.conf.iers_degraded_accuracy = "warn"
-    warnings.filterwarnings("ignore", message=".*dubious year.*")
+    from astropy.coordinates import get_body_barycentric, solar_system_ephemeris
+    iers.conf.auto_download = False
+    warnings.filterwarnings("ignore")
     ASTRO = True
 except ImportError:
     pass
@@ -52,36 +46,75 @@ app = Flask(__name__)
 
 AU_KM = 149_597_870.7
 EARTH_R_KM = 6371.0
-EARTH_EQ_R_KM = 6378.137
 MU_EARTH = 398_600.4418
 OBLIQ = math.radians(84381.406 / 3600)       # IAU 2006 mean obliquity at J2000
+J2000 = 2451545.0
 
 PLANETS = ["Mercury", "Venus", "Earth", "Mars", "Jupiter", "Saturn", "Uranus", "Neptune"]
 PERIOD_DAYS = {"Mercury": 87.969, "Venus": 224.701, "Earth": 365.256, "Mars": 686.980,
                "Jupiter": 4332.59, "Saturn": 10759.22, "Uranus": 30688.5, "Neptune": 60182.0}
-RADIUS_KM = {"Mercury": 2440, "Venus": 6052, "Earth": 6371, "Mars": 3390, "Jupiter": 69911,
-             "Saturn": 58232, "Uranus": 25362, "Neptune": 24622, "Moon": 1737}
 
-# SPHEREx orbit (fallback model only; the TLE path ignores these)
-SPHEREX_ALT_KM = 650.0
-LTAN_HOURS = 18.0   # local time of ascending node; dawn-dusk orbit (6 pm). Unverified; only flips the side.
 
-EPH_NAME = "Keplerian approximation (astropy not installed)"
-if ASTRO:
-    want = os.environ.get("XARVIS_EPHEMERIS", "builtin")
-    try:
-        solar_system_ephemeris.set(want)
-        get_body_barycentric("earth", Time(dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)))
-        EPH_NAME = "astropy built-in (ERFA)" if want == "builtin" else f"JPL {want.upper()}"
-    except Exception as exc:
-        print(f"[ephemeris] '{want}' unavailable ({exc!s:.80}); using astropy built-in")
-        solar_system_ephemeris.set("builtin")
-        EPH_NAME = "astropy built-in (ERFA)"
+def _jd(y, mo, d, h=0, mi=0, s=0):
+    return (dt.datetime(y, mo, d, h, mi, s) - dt.datetime(1970, 1, 1)).total_seconds() / 86400.0 + 2440587.5
+
+
+# SPHEREx facts, all from the IPAC SPHEREx Explanatory Supplement v2.1 (2026-11-10) and the NASA/JPL Horizons entry
+LAUNCH_JD = _jd(2025, 3, 12, 3, 10, 12)          # "launched on 12 March 2025 at 03:10:12 UTC"
+SCIENCE_START_JD = _jd(2025, 5, 1)               # "On May 1, 2025, the spacecraft began regular science operations"
+SCIENCE_END_JD = _jd(2027, 6, 1)                 # "nominal 25-month science mission"
+SPHEREX_A_KM = 7037.41                           # Table 1: mean semi-major axis
+SPHEREX_INC_DEG = 97.951                         # Table 1: inclination
+SPHEREX_MLTAN_H = 6.0                            # Table 1: mean local time of the ascending node, 6:00 AM
+HORIZONS_ID = "-163182"                          # SPHEREx in JPL Horizons
+HORIZONS_START_JD = _jd(2025, 3, 11)             # Horizons trajectory: 2025-Mar-11 .. latest TLE + 30 d
+HORIZONS_AHEAD_DAYS = 28.0                       # stay safely inside "+30 d"
+
+
+def now_jd():
+    return time.time() / 86400.0 + 2440587.5
+
+
+# ------------------------------------------------------------------ JPL DE440s ---
+DE_RANGE = None                  # (start_jd, end_jd) in TDB once the kernel is loaded
+EPH_NAME = "JPL DE440s (not loaded)"
+_de_lock = threading.Lock()
+
+
+def load_ephemeris():
+    """Load NASA/JPL's DE440s from NAIF (a 32 MB file, downloaded once and cached by astropy)."""
+    global DE_RANGE, EPH_NAME
+    if not ASTRO:
+        EPH_NAME = "unavailable (astropy not installed)"
+        return
+    with _de_lock:
+        if DE_RANGE is not None:
+            return
+        try:
+            solar_system_ephemeris.set("de440s")
+            from astropy.coordinates.solar_system import _get_kernel
+            segs = _get_kernel("de440s").segments
+            DE_RANGE = (max(s.start_jd for s in segs), min(s.end_jd for s in segs))
+            EPH_NAME = "JPL DE440s (NASA/JPL NAIF)"
+            print(f"[ephemeris] JPL DE440s loaded, covers JD {DE_RANGE[0]:.1f} .. {DE_RANGE[1]:.1f}")
+        except Exception as exc:
+            EPH_NAME = "JPL DE440s unavailable"
+            print(f"[ephemeris] could not load JPL DE440s ({exc!s:.100}). Install jplephem and allow naif.jpl.nasa.gov. "
+                  f"The viewer falls back to JPL's mean orbital elements.")
+
+
+def in_de(jd0, jd1=None):
+    jd1 = jd0 if jd1 is None else jd1
+    return DE_RANGE is not None and DE_RANGE[0] + 1 <= min(jd0, jd1) and max(jd0, jd1) <= DE_RANGE[1] - 1
+
+
+def utc(jd):
+    far = np.any(np.abs(np.asarray(jd, float) - J2000) > 150 * 365.25)
+    return Time(jd, format="jd", scale="tt" if far else "utc")
 
 
 # -------------------------------------------------------------------- maths ---
 def eq_to_ecl(v):
-    """Equatorial (ICRS/J2000) -> ecliptic J2000 for arrays shaped (..., 3)."""
     v = np.asarray(v, float)
     c, s = math.cos(OBLIQ), math.sin(OBLIQ)
     return np.stack([v[..., 0], v[..., 1] * c + v[..., 2] * s, -v[..., 1] * s + v[..., 2] * c], axis=-1)
@@ -93,32 +126,18 @@ def normalize(v):
 
 
 def close_loop(pts):
-    """Make a path sampled over one period, centred on "now" (middle sample), into a closed curve.
-
-    Real orbits don't repeat exactly (perturbations, the Sun's barycentric wobble), so the first and
-    last samples differ by up to millions of km. The drift is removed with a correction that is zero
-    at the middle sample, so the curve still passes exactly through the body's current position and
-    the seam ends up on the far side of the orbit, where it can't be seen.
-    """
+    """Close a path sampled over one period centred on "now" (middle sample). Real orbits don't repeat exactly, so
+    the ends differ by up to millions of km; the drift is removed with a correction that is zero at the middle sample,
+    so the curve still passes exactly through the body's position and the seam sits on the far side of the orbit."""
     pts = np.array(pts, float)
     n = len(pts) - 1
-    w = (np.arange(n + 1) - n / 2) / (n / 2)              # -1 .. 0 .. +1
+    w = (np.arange(n + 1) - n / 2) / (n / 2)
     pts = pts - 0.5 * (pts[-1] - pts[0]) * w[:, None]
     pts[-1] = pts[0]
     return pts
 
 
-def centred_times(t0, period, n, unit):
-    return t0 + np.linspace(-0.5, 0.5, n + 1) * period * unit
-
-
-def to_time(now):
-    return Time(now.replace(tzinfo=None), scale="utc")
-
-
-# --------------------------------------------------- ephemeris (astropy path) ---
 def helio_ecl(body, t):
-    """Heliocentric ecliptic J2000 position in AU of `body` at astropy Time `t` (scalar or array)."""
     d = get_body_barycentric(body.lower(), t) - get_body_barycentric("sun", t)
     return eq_to_ecl(np.moveaxis(d.xyz.to_value(u.au), 0, -1))
 
@@ -128,239 +147,135 @@ def geocentric_moon_ecl(t):
     return eq_to_ecl(np.moveaxis(d.xyz.to_value(u.au), 0, -1))
 
 
-# ------------------------------------------- ephemeris (Keplerian fallback) ---
-_KEP = {  # a, da, e, de, I, dI, L, dL, long.peri, dlp, long.node, dln  (Standish, 1800-2050)
-    "Mercury": (0.38709927, 0.00000037, 0.20563593, 0.00001906, 7.00497902, -0.00594749, 252.25032350, 149472.67411175, 77.45779628, 0.16047689, 48.33076593, -0.12534081),
-    "Venus": (0.72333566, 0.00000390, 0.00677672, -0.00004107, 3.39467605, -0.00078890, 181.97909950, 58517.81538729, 131.60246718, 0.00268329, 76.67984255, -0.27769418),
-    "Earth": (1.00000261, 0.00000562, 0.01671123, -0.00004392, -0.00001531, -0.01294668, 100.46457166, 35999.37244981, 102.93768193, 0.32327364, 0.0, 0.0),
-    "Mars": (1.52371034, 0.00001847, 0.09339410, 0.00007882, 1.84969142, -0.00813131, -4.55343205, 19140.30268499, -23.94362959, 0.44441088, 49.55953891, -0.29257343),
-    "Jupiter": (5.20288700, -0.00011607, 0.04838624, -0.00013253, 1.30439695, -0.00183714, 34.39644051, 3034.74612775, 14.72847983, 0.21252668, 100.47390909, 0.20469106),
-    "Saturn": (9.53667594, -0.00125060, 0.05386179, -0.00050991, 2.48599187, 0.00193609, 49.95424423, 1222.49362201, 92.59887831, -0.41897216, 113.66242448, -0.28867794),
-    "Uranus": (19.18916464, -0.00196176, 0.04725744, -0.00004397, 0.77263783, -0.00242939, 313.23810451, 428.48202785, 170.95427630, 0.40805281, 74.01692503, 0.04240589),
-    "Neptune": (30.06992276, 0.00026291, 0.00859048, 0.00005105, 1.77004347, 0.00035372, -55.12002969, 218.45945325, 44.96476227, -0.32241464, 131.78422574, -0.00508664),
-}
+def earth_helio(jd):
+    if in_de(jd):
+        return helio_ecl("earth", utc(jd))
+    # outside DE440s only the Sun's direction matters (for the orbit-model plane): JPL's mean elements for Earth
+    L = math.radians(100.46457166 + 35999.37244981 * (jd - J2000) / 36525.0)
+    return np.array([math.cos(L), math.sin(L), 0.0])
 
 
-def _kep_pos(name, T, E=None):
-    a0, da, e0, de, i0, di, l0, dl, w0, dw, o0, do = _KEP[name]
-    a, e, inc = a0 + da * T, e0 + de * T, math.radians(i0 + di * T)
-    L, lp, node = l0 + dl * T, w0 + dw * T, o0 + do * T
-    w, node_r = math.radians(lp - node), math.radians(node)
-    if E is None:
-        M = math.radians(((L - lp) + 180) % 360 - 180)
-        E = M + e * math.sin(M)
-        for _ in range(12):
-            E -= (E - e * math.sin(E) - M) / (1 - e * math.cos(E))
-    xp, yp = a * (math.cos(E) - e), a * math.sqrt(1 - e * e) * math.sin(E)
-    cw, sw, co, so, ci, si = math.cos(w), math.sin(w), math.cos(node_r), math.sin(node_r), math.cos(inc), math.sin(inc)
-    return [(cw * co - sw * so * ci) * xp + (-sw * co - cw * so * ci) * yp,
-            (cw * so + sw * co * ci) * xp + (-sw * so + cw * co * ci) * yp,
-            (sw * si) * xp + (cw * si) * yp]
+# ------------------------------------------------------------------ SPHEREx ---
+_hz_cache = {}
+_hz_fail = {"until": 0.0}
 
 
-def julian_date(now):
-    return now.timestamp() / 86400.0 + 2440587.5
-
-
-# ----------------------------------------------------------------- SPHEREx ---
-_tle = {"sat": None, "fetched": 0.0}
-_tle_lock = threading.Lock()
-
-
-def get_satrec():
-    """SPHEREx TLE from CelesTrak (cached 6 h; failures retried after 10 min)."""
-    if Satrec is None:
+def horizons_spherex(jd):
+    """SPHEREx geocentric state (position km, velocity km/s) in ecliptic J2000 from NASA/JPL Horizons, or None."""
+    if not (HORIZONS_START_JD <= jd <= now_jd() + HORIZONS_AHEAD_DAYS):
         return None
-    with _tle_lock:
-        age = time.time() - _tle["fetched"]
-        if _tle["sat"] is not None and age < 6 * 3600:
-            return _tle["sat"]
-        if _tle["sat"] is None and _tle["fetched"] and age < 600:
-            return None
-        _tle["fetched"] = time.time()
+    key = round(jd * 1440)                                        # one answer per minute
+    if key in _hz_cache:
+        return _hz_cache[key]
+    if time.time() < _hz_fail["until"]:
+        return None
+    params = {"format": "text", "COMMAND": f"'{HORIZONS_ID}'", "OBJ_DATA": "'NO'", "MAKE_EPHEM": "'YES'", "EPHEM_TYPE": "'VECTORS'",
+              "CENTER": "'500@399'", "TLIST": f"'{key / 1440.0:.9f}'", "TLIST_TYPE": "'JD'", "TIME_TYPE": "'UT'",
+              "REF_PLANE": "'ECLIPTIC'", "REF_SYSTEM": "'ICRF'", "OUT_UNITS": "'KM-S'", "VEC_TABLE": "'2'", "CSV_FORMAT": "'YES'"}
+    last = None
+    for attempt in range(3):
         try:
-            url = "https://celestrak.org/NORAD/elements/gp.php?NAME=SPHEREX&FORMAT=TLE"
-            with urllib.request.urlopen(url, timeout=4) as r:
-                lines = [l.strip() for l in r.read().decode().splitlines()]
-            l1 = next(l for l in lines if l.startswith("1 "))
-            l2 = next(l for l in lines if l.startswith("2 "))
-            _tle["sat"] = Satrec.twoline2rv(l1, l2)
+            txt = requests.get("https://ssd.jpl.nasa.gov/api/horizons.api", params=params, timeout=30).text
+            i, j = txt.index("$$SOE"), txt.index("$$EOE")
+            row = txt[i + 5:j].strip().split(",")
+            st = np.array([float(x) for x in row[2:8]])
+            if len(_hz_cache) > 5000:
+                _hz_cache.clear()
+            _hz_cache[key] = (st[:3], st[3:])
+            return _hz_cache[key]
         except Exception as exc:
-            print(f"[SPHEREx] TLE unavailable ({exc!s:.80}); using sun-synchronous orbit model")
-            _tle["sat"] = None
-        return _tle["sat"]
+            last = exc
+            time.sleep(1.5)
+    _hz_fail["until"] = time.time() + 60                            # back off for a minute, use the model meanwhile
+    print(f"[SPHEREx] Horizons unavailable ({last!s:.80}); using the orbit model for a minute")
+    return None
 
 
-_teme_cache = {"hour": None, "M": None}
+_track_cache = {}
 
 
-def teme_to_ecl(r_km, t):
-    """TEME (km, shape (N,3)) -> ecliptic J2000 axes. TEME->GCRS is a slow precession/nutation
-    rotation, so it is computed once per hour and cached (the full transform costs ~0.4 s)."""
-    first = t if np.ndim(t.utc.jd1) == 0 else t[0]
-    hour = int((float(first.utc.jd1) + float(first.utc.jd2)) * 24)
-    if _teme_cache["M"] is None or hour != _teme_cache["hour"]:
-        try:
-            basis = CartesianRepresentation(np.eye(3) * 7000 * u.km)     # column k = unit vector k
-            g = TEME(basis, obstime=first).transform_to(GCRS(obstime=first))
-            _teme_cache["M"] = g.cartesian.xyz.to_value(u.km) / 7000     # M @ r_teme = r_gcrs
-        except Exception as exc:
-            print(f"[SPHEREx] TEME->GCRS failed ({exc!s:.80}); ignoring precession (~0.4 deg)")
-            _teme_cache["M"] = np.eye(3)
-        _teme_cache["hour"] = hour
-    return eq_to_ecl(np.asarray(r_km) @ _teme_cache["M"].T)
-
-
-def sso_offset_km(when, earth_helio, minutes=0.0):
-    """Fallback: SPHEREx relative to Earth on an ideal sun-synchronous dawn-dusk orbit (ecliptic, km)."""
-    a = EARTH_R_KM + SPHEREX_ALT_KM
-    inc = math.acos(-((a / 12352.0) ** 3.5))                 # J2 sun-synchronous condition
-    period_s = 2 * math.pi * math.sqrt(a ** 3 / MU_EARTH)
-    # Sun's right ascension from Earth (equatorial frame)
-    sun_ecl = -np.asarray(earth_helio)
-    c, s = math.cos(OBLIQ), math.sin(OBLIQ)
-    sun_eq = np.array([sun_ecl[0], sun_ecl[1] * c - sun_ecl[2] * s, sun_ecl[1] * s + sun_ecl[2] * c])
-    ra_sun = math.atan2(sun_eq[1], sun_eq[0])
-    raan = ra_sun + math.radians((LTAN_HOURS - 12.0) * 15.0)
-    u_arg = 2 * math.pi * (((when.timestamp() + minutes * 60) % period_s) / period_s)   # phase is arbitrary
-    cu, su, co, so, ci, si = math.cos(u_arg), math.sin(u_arg), math.cos(raan), math.sin(raan), math.cos(inc), math.sin(inc)
-    eq = a * np.array([cu * co - su * ci * so, cu * so + su * ci * co, su * si])
-    return eq_to_ecl(eq), period_s / 60.0
-
-
-_ring_cache = {"t": 0.0, "ring": None, "period": None, "key": None}
-
-
-def spherex_geometry(now, earth_helio, sat):
-    """-> offset from Earth centre (km, ecliptic), orbit ring (AU, relative to Earth), period (min)."""
-    if sat is not None and ASTRO:
-        t = to_time(now)
-        _e, r, _v = sat.sgp4_array(np.atleast_1d(t.utc.jd1), np.atleast_1d(t.utc.jd2))
-        period = 2 * math.pi / sat.no_kozai
-        if _e[0] == 0:
-            off = teme_to_ecl(r[0], t)
-            if _ring_cache["key"] != "tle" or time.time() - _ring_cache["t"] > 30:
-                ts = centred_times(t, period, 120, u.min)
-                err, rr, _ = sat.sgp4_array(ts.utc.jd1, ts.utc.jd2)
-                ring = close_loop(teme_to_ecl(rr, ts) / AU_KM)
-                _ring_cache.update(t=time.time(), ring=ring.tolist(), period=period, key="tle")
-            return off, _ring_cache["ring"], period
-    off, period = sso_offset_km(now, earth_helio)
-    if _ring_cache["key"] != "sso" or time.time() - _ring_cache["t"] > 30:
-        ring = [(sso_offset_km(now, earth_helio, period * (k / 120 - 0.5))[0] / AU_KM).tolist() for k in range(121)]
-        _ring_cache.update(t=time.time(), ring=ring, period=period, key="sso")
-    return off, _ring_cache["ring"], period
-
-
-# ------------------------------------------------------------ dwarf planets ---
-# name: (JPL Horizons id, id_type, orbital period in days, radius km)
-DWARFS = {
-    "Ceres": ("1", "smallbody", 1680.0, 473),
-    "Pluto": ("999", "majorbody", 90560.0, 1188),
-    "Haumea": ("136108", "smallbody", 103400.0, 816),
-    "Makemake": ("136472", "smallbody", 111800.0, 715),
-    "Eris": ("136199", "smallbody", 204200.0, 1163),
-}
-DWARF_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dwarf_cache.json")
-_dwarf = {"paths": {}, "jd": {}, "status": "starting", "source": {}}
-_dwarf_lock = threading.Lock()
-
-
-def _load_dwarf_cache():
+def horizons_spherex_track(jd):
+    """SPHEREx geocentric positions (km, ecliptic J2000) every 2 minutes from 60 minutes before to 60 minutes after jd,
+    from NASA/JPL Horizons. The viewer interpolates along these, so the drawn spacecraft stays on the real trajectory
+    (a single snapshot propagated on a circle drifts ~0.5 deg within an hour)."""
+    start = math.floor(jd * 720) / 720 - 30 / 720                 # 2-minute grid
+    key = round(start * 720)
+    if key in _track_cache:
+        return _track_cache[key]
+    if time.time() < _hz_fail["until"]:
+        return None
+    params = {"format": "text", "COMMAND": f"'{HORIZONS_ID}'", "OBJ_DATA": "'NO'", "MAKE_EPHEM": "'YES'", "EPHEM_TYPE": "'VECTORS'",
+              "CENTER": "'500@399'", "START_TIME": f"'JD {start:.9f}'", "STOP_TIME": f"'JD {start + 61 / 720:.9f}'", "STEP_SIZE": "'2m'",
+              "TIME_TYPE": "'UT'", "REF_PLANE": "'ECLIPTIC'", "REF_SYSTEM": "'ICRF'", "OUT_UNITS": "'KM-S'", "VEC_TABLE": "'1'", "CSV_FORMAT": "'YES'"}
     try:
-        import json
-        with open(DWARF_CACHE) as f:
-            d = json.load(f)
-        jd_now = julian_date(dt.datetime.now(dt.timezone.utc))
-        for name, v in d.items():
-            jd = np.array(v["jd"])
-            span = jd[-1] - jd[0]
-            if jd[0] + 0.1 * span < jd_now < jd[-1] - 0.1 * span:      # still centred well enough
-                _dwarf["paths"][name] = np.array(v["pts"]); _dwarf["jd"][name] = jd
-                _dwarf["source"][name] = "JPL Horizons (cached)"
+        txt = requests.get("https://ssd.jpl.nasa.gov/api/horizons.api", params=params, timeout=30).text
+        i, j = txt.index("$$SOE"), txt.index("$$EOE")
+        rows = [ln.split(",") for ln in txt[i + 5:j].strip().splitlines()]
+        out = [[float(r[0]), round(float(r[2]), 3), round(float(r[3]), 3), round(float(r[4]), 3)] for r in rows]
     except Exception:
-        pass
-
-
-def _fetch_dwarfs():
-    """Background thread: trace each dwarf planet's orbit from JPL Horizons (one call per body)."""
-    try:
-        from astroquery.jplhorizons import Horizons
-    except ImportError:
-        _dwarf["status"] = "astroquery not installed"
-        return
-    import json
-    now = dt.datetime.now(dt.timezone.utc)
-    cache, failed = {}, []
-    for name, (hid, idt, period, _r) in DWARFS.items():
-        if name in _dwarf["paths"]:
-            continue
-        try:
-            step = max(1, round(period / 360))
-            ep = {"start": (now - dt.timedelta(days=period / 2)).strftime("%Y-%m-%d"),
-                  "stop": (now + dt.timedelta(days=period / 2)).strftime("%Y-%m-%d"), "step": f"{step}d"}
-            vec = Horizons(id=hid, id_type=idt, location="@sun", epochs=ep).vectors(refplane="ecliptic")
-            pts = np.column_stack([np.array(vec["x"], float), np.array(vec["y"], float), np.array(vec["z"], float)])
-            jd = np.array(vec["datetime_jd"], float)
-            with _dwarf_lock:
-                _dwarf["paths"][name] = pts; _dwarf["jd"][name] = jd; _dwarf["source"][name] = "JPL Horizons"
-            cache[name] = {"pts": pts.tolist(), "jd": jd.tolist()}
-        except Exception as exc:
-            failed.append(name)
-            print(f"[dwarfs] {name}: Horizons unavailable ({exc!s:.90})")
-    if cache:
-        try:
-            old = {}
-            if os.path.exists(DWARF_CACHE):
-                with open(DWARF_CACHE) as f:
-                    old = json.load(f)
-            old.update(cache)
-            with open(DWARF_CACHE, "w") as f:
-                json.dump(old, f)
-        except Exception:
-            pass
-    _dwarf["status"] = "ready" if not failed else f"partial (offline: {', '.join(failed)})"
-
-
-def start_dwarf_fetch():
-    _load_dwarf_cache()
-    threading.Thread(target=_fetch_dwarfs, daemon=True).start()
-
-
-# Offline fallback: Pluto from Standish's approximate elements (the only dwarf I can do reliably without Horizons)
-_KEP["Pluto"] = (39.48211675, -0.00031596, 0.24882730, 0.00005170, 17.14001206, 0.00004818,
-                 238.92903833, 145.20780515, 224.06891629, -0.04062942, 110.30393684, -0.01183482)
-
-
-def dwarf_positions(now):
-    """[{name, pos, radius_km, source}] for every dwarf planet we can place."""
-    jd_now = julian_date(now)
-    out = []
-    for name, (_h, _i, period, radius) in DWARFS.items():
-        with _dwarf_lock:
-            pts, jd = _dwarf["paths"].get(name), _dwarf["jd"].get(name)
-        if pts is not None and jd[0] <= jd_now <= jd[-1]:
-            pos = [float(np.interp(jd_now, jd, pts[:, k])) for k in range(3)]
-            out.append({"name": name, "pos": pos, "radius_km": radius, "source": _dwarf["source"][name]})
-        elif name == "Pluto":
-            T = (jd_now - 2451545.0) / 36525.0
-            out.append({"name": name, "pos": _kep_pos("Pluto", T), "radius_km": radius,
-                        "source": "approximate (Standish elements; Horizons offline)"})
+        return None
+    if len(_track_cache) > 2000:
+        _track_cache.clear()
+    _track_cache[key] = out
     return out
 
 
-def dwarf_paths():
-    """{name: closed path (AU)} plus fallback ellipse for Pluto when Horizons data is missing."""
-    out = {}
-    for name in DWARFS:
-        with _dwarf_lock:
-            pts = _dwarf["paths"].get(name)
-        if pts is not None:
-            out[name] = np.round(close_loop(pts), 5).tolist()
-        elif name == "Pluto":
-            T = (julian_date(dt.datetime.now(dt.timezone.utc)) - 2451545.0) / 36525.0
-            out[name] = [[round(c, 5) for c in _kep_pos("Pluto", T, 2 * math.pi * k / 360)] for k in range(361)]
-    return out
+def mean_sun_ra_j2000_deg(jd):
+    T = (jd - J2000) / 36525.0
+    return (280.46646 + 36000.76983 * T - 1.396971 * T) % 360.0
+
+
+def sso_snapshot(jd):
+    """Ideal sun-synchronous orbit with SPHEREx's published parameters: plane set by the mean local time of the
+    ascending node (6:00 AM) and the Sun's mean position; phase along the orbit arbitrary."""
+    a = SPHEREX_A_KM
+    inc = math.radians(SPHEREX_INC_DEG)
+    period_s = 2 * math.pi * math.sqrt(a ** 3 / MU_EARTH)
+    raan = math.radians(mean_sun_ra_j2000_deg(jd) + (SPHEREX_MLTAN_H - 12.0) * 15.0)
+    ua = 2 * math.pi * (((jd * 86400.0) % period_s) / period_s)
+    cu, su, co, so, ci, si = math.cos(ua), math.sin(ua), math.cos(raan), math.sin(raan), math.cos(inc), math.sin(inc)
+    r_eq = np.array([cu * co - su * ci * so, cu * so + su * ci * co, su * si])
+    n_eq = np.array([so * si, -co * si, ci])
+    return eq_to_ecl(r_eq), eq_to_ecl(n_eq), a, period_s / 60.0, SPHEREX_INC_DEG
+
+
+def spherex_snapshot(jd):
+    """Orbit state at one instant: unit vector to SPHEREx, orbit normal, radius, period and where the numbers came from."""
+    base = {"jd": jd, "available": jd >= LAUNCH_JD}
+    st = horizons_spherex(jd)
+    if st is not None:
+        r, v = st
+        base["jd"] = round(jd * 1440) / 1440.0             # Horizons was asked for this minute: label the state with it
+        rn = float(np.linalg.norm(r))
+        h = np.cross(r, v)
+        sma = -MU_EARTH / (2 * (float(np.dot(v, v)) / 2 - MU_EARTH / rn))      # osculating semi-major axis
+        period_min = 2 * math.pi * math.sqrt(sma ** 3 / MU_EARTH) / 60.0
+        # The osculating period differs from SPHEREx's true average period (Earth's bulge), which made the drawn
+        # spacecraft drift ~0.6 deg within an hour. Measure the real angular rate from a second Horizons state about one
+        # orbit later: the angle travelled around the orbit normal, plus one full turn.
+        jd2 = round((base["jd"] + period_min / 1440.0) * 1440) / 1440.0
+        st2 = horizons_spherex(jd2)
+        if st2 is not None:
+            u1, u2, nn = normalize(r), normalize(st2[0]), normalize(h)
+            dphi = math.atan2(float(np.dot(np.cross(u1, u2), nn)), float(np.dot(u1, u2)))
+            rate = (2 * math.pi + dphi) / ((jd2 - base["jd"]) * 1440.0)           # rad per minute
+            if abs(rate * period_min / (2 * math.pi) - 1) < 0.02:                  # sanity check
+                period_min = 2 * math.pi / rate
+        return {**base, "live": True, "u": normalize(r).tolist(), "n": normalize(h).tolist(), "a_km": rn,
+                "period_min": period_min, "track": horizons_spherex_track(jd),
+                "inc_deg": math.degrees(math.acos(float(np.clip(  # inclination to the Earth's equator (the ecliptic-frame normal is rotated back)
+                    (h[1] * math.sin(OBLIQ) + h[2] * math.cos(OBLIQ)) / np.linalg.norm(h), -1, 1)))),
+                "source": "NASA/JPL Horizons (from Space-Track TLEs)"}
+    u_vec, n_vec, a, period, inc = sso_snapshot(jd)
+    if jd < HORIZONS_START_JD:
+        why = "before the Horizons trajectory begins (11 Mar 2025)"
+    elif jd > now_jd() + HORIZONS_AHEAD_DAYS:
+        why = "beyond the 30 days Horizons predicts"
+    else:
+        why = "Horizons not reachable"
+    return {**base, "live": False, "u": normalize(u_vec).tolist(), "n": normalize(n_vec).tolist(), "a_km": a,
+            "period_min": period, "inc_deg": inc,
+            "source": f"APPROXIMATE orbit model ({why}); official orbit parameters, position along the orbit unknown"}
 
 
 # ------------------------------------------------------------------- routes ---
@@ -369,83 +284,232 @@ def index():
     return render_template("index.html")
 
 
-_orbit_cache = {"t": 0.0, "data": None}
+@app.route("/about", strict_slashes=False)
+@app.route("/about.html")
+def about():
+    return render_template("about.html")
+
+
+@app.errorhandler(404)
+def not_found(e):
+    if request.path.startswith("/api/"):                 # API callers get JSON, people get the page
+        return jsonify({"error": "not found"}), 404
+    return render_template("404.html"), 404
+
+
+@app.route("/api/meta")
+def meta():
+    return jsonify({
+        "ephemeris": EPH_NAME, "now_jd": now_jd(),
+        "de_start_jd": DE_RANGE[0] if DE_RANGE else None, "de_end_jd": DE_RANGE[1] if DE_RANGE else None,
+        "launch_jd": LAUNCH_JD, "science_start_jd": SCIENCE_START_JD, "science_end_jd": SCIENCE_END_JD,
+        "horizons_start_jd": HORIZONS_START_JD, "horizons_end_jd": now_jd() + HORIZONS_AHEAD_DAYS,
+    })
+
+
+@app.route("/api/track")
+def track():
+    """Positions of every planet (heliocentric) and the Moon (geocentric) on a regular grid, from JPL DE440s."""
+    jd0, step = float(request.args["jd0"]), float(request.args["step"])
+    n = int(min(max(int(request.args["n"]), 4), 6000))
+    if not ASTRO or not in_de(jd0, jd0 + step * (n - 1)):
+        return jsonify({"error": "outside the JPL DE440s ephemeris"}), 422
+    t = utc(jd0 + step * np.arange(n))
+    pos = np.stack([helio_ecl(b, t) for b in PLANETS], axis=1)
+    moon = geocentric_moon_ecl(t)
+    return jsonify({"jd0": jd0, "step": step, "n": n, "bodies": PLANETS, "pos": np.round(pos.reshape(-1), 9).tolist(),
+                    "moon": np.round(moon.reshape(-1), 9).tolist()})
+
+
+@app.route("/api/spherex")
+def spherex_route():
+    return jsonify(spherex_snapshot(float(request.args.get("jd", now_jd()))))
+
+
+_orbit_cache = {}
 
 
 @app.route("/api/orbits")
 def orbits():
-    """Each planet's path over one full period, starting now (from ephemeris positions)."""
-    if _orbit_cache["data"] is None or time.time() - _orbit_cache["t"] > 3600:
-        now = dt.datetime.now(dt.timezone.utc)
+    """Each planet's path over one full period, centred on the requested time and closed (see close_loop)."""
+    jd = float(request.args.get("jd", now_jd()))
+    if not ASTRO or not in_de(jd):
+        return jsonify({"error": "outside the JPL DE440s ephemeris"}), 422
+    key = round(jd / 30.0)
+    if key not in _orbit_cache:
         out = {}
-        if ASTRO:
-            t0 = to_time(now)
-            for name in PLANETS:
-                ts = centred_times(t0, PERIOD_DAYS[name], 360, u.day)
-                out[name] = np.round(close_loop(helio_ecl(name, ts)), 7).tolist()
+        for name in PLANETS:
+            ts = np.clip(jd + np.linspace(-0.5, 0.5, 361) * PERIOD_DAYS[name], DE_RANGE[0] + 1, DE_RANGE[1] - 1)   # stay inside the kernel
+            out[name] = np.round(close_loop(helio_ecl(name, utc(ts))), 7).tolist()
+        if len(_orbit_cache) > 40:
+            _orbit_cache.clear()
+        _orbit_cache[key] = out
+    return jsonify({"jd": jd, "orbits": _orbit_cache[key]})
+
+
+
+# ------------------------------------------------------------- object lookup (any JPL small body) ---
+SBDB_API = "https://ssd-api.jpl.nasa.gov/sbdb.api"
+_lookup_cache = {}
+
+
+def _num(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def horizons_elements(des, kind):
+    """Heliocentric ecliptic J2000 osculating elements of a small body at the current time, from NASA/JPL Horizons."""
+    cmd = f"{des};" if kind[1:2] == "n" and str(des).isdigit() else f"DES={des};" + (" CAP;" if kind.startswith("c") else "")
+    try:
+        t = requests.get("https://ssd.jpl.nasa.gov/api/horizons.api", timeout=30, params={
+            "format": "text", "COMMAND": f"'{cmd}'", "EPHEM_TYPE": "ELEMENTS", "CENTER": "'500@10'", "REF_PLANE": "ECLIPTIC",
+            "TLIST": f"{now_jd():.5f}", "TLIST_TYPE": "JD", "TIME_TYPE": "TDB", "CSV_FORMAT": "YES", "OUT_UNITS": "AU-D"}).text
+        head = re.search(r"^\s*JDTDB,.*$", t, re.M).group(0)
+        body = re.search(r"\$\$SOE\s*(.*?)\$\$EOE", t, re.S).group(1).strip().splitlines()[0]
+        cols = [c.strip() for c in head.split(",")]
+        vals = [v.strip() for v in body.split(",")]
+        el = {c: float(v) for c, v in zip(cols, vals) if c and c != "Calendar Date (TDB)"}
+        return el if el.get("EC", 1) < 1 and el.get("A", -1) > 0 else None
+    except Exception:
+        return None
+
+
+@app.route("/api/sbdb/lookup")
+def sbdb_lookup():
+    """Look up one asteroid or comet in NASA/JPL's Small-Body Database and return its orbit in the same row format as
+    static/small_bodies.json, so the viewer can track it. Several matches -> the list, so the user can pick one."""
+    q = (request.args.get("q") or "").strip()[:60]
+    if not q:
+        return jsonify({"error": "empty search"}), 400
+    if q.lower() in _lookup_cache:
+        return jsonify(_lookup_cache[q.lower()])
+    try:
+        r = requests.get(SBDB_API, params={"sstr": q, "phys-par": "1", "full-prec": "1"}, timeout=25)
+        d = r.json()
+    except Exception as e:                                   # network problem: say so, the viewer keeps working
+        return jsonify({"error": f"NASA/JPL SBDB did not answer ({type(e).__name__})"}), 502
+    if str(d.get("code")) == "300":
+        out = {"matches": [{"des": m.get("pdes"), "name": m.get("name")} for m in d.get("list", [])][:40]}
+    elif "object" not in d:
+        out = {"error": d.get("message", "not found")}
+    else:
+        o, orb = d["object"], d.get("orbit") or {}
+        el = {e["name"]: _num(e.get("value")) for e in orb.get("elements", [])}
+        phys = {p["name"]: p.get("value") for p in d.get("phys_par", [])}
+        epoch = _num(orb.get("epoch"))
+        e, a = el.get("e"), el.get("a")
+        if e is None or a is None or epoch is None or e >= 1 or a <= 0:
+            out = {"error": f"{o.get('fullname', q)} is on an open (hyperbolic) or incomplete orbit, which this viewer cannot draw"}
         else:
-            T = (julian_date(now) - 2451545.0) / 36525.0
-            for name in PLANETS:
-                out[name] = [[round(c, 6) for c in _kep_pos(name, T, 2 * math.pi * k / 360)] for k in range(361)]
-        _orbit_cache.update(t=time.time(), data=out)
-    return jsonify(_orbit_cache["data"])
+            ma = el.get("ma")
+            if ma is None and el.get("tp") is not None:      # some comets give the perihelion time instead of the mean anomaly
+                ma = (0.01720209895 / a ** 1.5 * (epoch - el["tp"]) * 180 / math.pi) % 360
+            kind = o.get("kind") or ""
+            # SBDB's elements can be years old (Bennu: 2011), and a two-body advance from there drifts by millions of km.
+            # Ask Horizons for osculating elements at the current date instead; keep SBDB's if Horizons does not answer.
+            fresh = horizons_elements(o.get("des") or q, kind)
+            if fresh:
+                a, e, epoch = fresh["A"], fresh["EC"], fresh["JDTDB"]
+                el.update({"i": fresh["IN"], "om": fresh["OM"], "w": fresh["W"]}); ma = fresh["MA"]
+            flags = ("n" if kind[1:2] == "n" else "p") + ("N" if o.get("neo") else "") + ("P" if o.get("pha") else "")
+            h = _num(phys.get("H"))
+            row = [a, e, el.get("i"), el.get("om"), el.get("w"), ma, epoch, h, _num(phys.get("diameter")), o.get("fullname", q).strip(), flags]
+            out = {"object": {"row": row, "comet": kind.startswith("c"), "class": (o.get("orbit_class") or {}).get("name"),
+                              "spkid": o.get("spkid"), "elements": "NASA/JPL Horizons, osculating at today's date" if fresh else "NASA/JPL SBDB",
+                              "source": "NASA/JPL Small-Body Database API"}}
+    if len(_lookup_cache) > 500:
+        _lookup_cache.clear()
+    _lookup_cache[q.lower()] = out
+    return jsonify(out)
 
 
-@app.route("/api/dwarf_orbits")
-def dwarf_orbits():
-    return jsonify({"status": _dwarf["status"], "paths": dwarf_paths(),
-                    "complete": all(n in _dwarf["paths"] for n in DWARFS)})
+
+# ------------------------------------------- known asteroids and comets inside a patch of sky (JPL SB Ident) ---
+SBIDENT_API = "https://ssd-api.jpl.nasa.gov/sb_ident.api"
+_ident_cache = {}
 
 
-@app.route("/api/state")
-def state():
-    now = dt.datetime.now(dt.timezone.utc)
-    moon_ring = None
-    if ASTRO:
-        t = to_time(now)
-        planets = [{"name": n, "pos": helio_ecl(n, t).tolist(), "radius_km": RADIUS_KM[n]} for n in PLANETS]
-        earth = np.array(next(p["pos"] for p in planets if p["name"] == "Earth"))
-        moon_off = geocentric_moon_ecl(t)
-        planets.append({"name": "Moon", "pos": (earth + moon_off).tolist(), "radius_km": RADIUS_KM["Moon"]})
-        moon_ring = np.round(close_loop(geocentric_moon_ecl(centred_times(t, 27.32, 240, u.day))), 8).tolist()
-    else:
-        T = (julian_date(now) - 2451545.0) / 36525.0
-        planets = [{"name": n, "pos": _kep_pos(n, T), "radius_km": RADIUS_KM[n]} for n in PLANETS]
-        earth = np.array(next(p["pos"] for p in planets if p["name"] == "Earth"))
+def _sexa(x, hours):
+    """degrees -> 'hh-mm-ss.ss' (RA) or '[M]dd-mm-ss.s' (Dec), the formats the SB Ident API wants"""
+    neg = x < 0
+    v = abs(x) / 15 if hours else abs(x)
+    d = int(v); m = int((v - d) * 60); sec = (v - d - m / 60) * 3600
+    if sec >= 59.995:
+        sec = 0; m += 1
+    if m == 60:
+        m = 0; d += 1
+    return ("M" if neg else "") + f"{d:02d}-{m:02d}-{sec:05.2f}"
 
-    sat = get_satrec()
-    off_km, ring, period = spherex_geometry(now, earth, sat)
-    pos = earth + off_km / AU_KM
-    r = float(np.linalg.norm(pos))
-    dist_earth = float(np.linalg.norm(off_km))
-    if sat is not None and ASTRO:
-        tle_age = julian_date(now) - (sat.jdsatepoch + sat.jdsatepochF)
-        source = f"CelesTrak TLE, SGP4 (epoch {tle_age:.1f} d old)"
-    else:
-        tle_age = None
-        source = "APPROXIMATE: sun-sync model, phase unknown (pip install sgp4)" if Satrec is None \
-            else "APPROXIMATE: sun-sync model, phase unknown (TLE fetch failed)"
-    return jsonify({
-        "utc": now.strftime("%Y-%m-%d %H:%M:%S"),
-        "ephemeris": EPH_NAME,
-        "planets": planets,
-        "dwarfs": dwarf_positions(now),
-        "moon_ring": moon_ring,
-        "sun_dir": normalize(-earth).tolist(),
-        "spherex": {
-            "pos": pos.tolist(), "ring": ring,
-            "helio_dist_au": r,
-            "ecl_lon_deg": math.degrees(math.atan2(pos[1], pos[0])) % 360,
-            "ecl_lat_deg": math.degrees(math.asin(pos[2] / r)),
-            "earth_dist_km": dist_earth,
-            "altitude_km": dist_earth - EARTH_R_KM,
-            "period_min": period,
-            "live": bool(sat is not None and ASTRO),
-            "source": source,
-        },
-    })
+
+@app.route("/api/sbident")
+def sbident():
+    """Which known asteroids and comets are inside a box of sky at a given time, seen from Earth's centre (NASA/JPL SB Ident,
+    fast first pass: positions good to about an arcminute)."""
+    try:
+        ra, dec, jd = float(request.args["ra"]), float(request.args["dec"]), float(request.args.get("jd", now_jd()))
+        hw = min(max(float(request.args.get("hw", 0.25)), 0.01), 5.65)
+    except (KeyError, ValueError):
+        return jsonify({"error": "need ra, dec (degrees), optional jd and hw (half-width, degrees)"}), 400
+    t = dt.datetime(2000, 1, 1, 12, tzinfo=dt.timezone.utc) + dt.timedelta(days=jd - 2451545.0)
+    key = (round(ra, 3), round(dec, 3), round(jd, 3), round(hw, 3))
+    if key in _ident_cache:
+        return jsonify(_ident_cache[key])
+    params = {"mag-required": "true", "req-elem": "false", "mpc-code": "500", "obs-time": t.strftime("%Y-%m-%d_%H:%M:%S"),
+              "fov-ra-center": _sexa(ra, True), "fov-dec-center": _sexa(dec, False), "fov-ra-hwidth": f"{hw:.4f}", "fov-dec-hwidth": f"{hw:.4f}"}
+    d, err = None, None
+    for attempt in range(3):                                   # JPL occasionally answers with an error page: try up to 3 times
+        try:
+            d = requests.get(SBIDENT_API, timeout=45, params=params).json()
+            break
+        except Exception as e:
+            err = e
+            time.sleep(1.5)
+    if d is None:
+        return jsonify({"error": f"NASA/JPL SB Ident did not answer ({type(err).__name__})"}), 502
+    if "fields_first" not in d:
+        return jsonify({"error": d.get("message", "no answer")}), 502
+    f = d["fields_first"]; rows = d.get("data_first_pass") or []
+    col = {k: f.index(k) for k in f}
+    # The first pass is a coarse pre-selection that also returns objects far outside the box: keep only those whose
+    # position actually falls inside it (measured on the sky from the box centre).
+    c0 = np.array([math.cos(math.radians(dec)) * math.cos(math.radians(ra)), math.cos(math.radians(dec)) * math.sin(math.radians(ra)), math.sin(math.radians(dec))])
+    east = np.array([-math.sin(math.radians(ra)), math.cos(math.radians(ra)), 0.0]); north = np.cross(c0, east)
+    objs = []
+    for x in rows:
+        try:
+            h, m, sec = (float(p) for p in x[1].split(":"))
+            dd = x[2].replace("'", " ").replace('"', " ").split()
+            sgn = -1 if dd[0].startswith("-") else 1
+            ora = (h + m / 60 + sec / 3600) * 15
+            odec = sgn * (abs(float(dd[0])) + float(dd[1]) / 60 + float(dd[2]) / 3600)
+        except (ValueError, IndexError):
+            continue
+        u = np.array([math.cos(math.radians(odec)) * math.cos(math.radians(ora)), math.cos(math.radians(odec)) * math.sin(math.radians(ora)), math.sin(math.radians(odec))])
+        if u @ c0 <= 0:
+            continue
+        xe, yn = (u @ east) / (u @ c0), (u @ north) / (u @ c0)          # gnomonic offsets (radians) east and north of the centre
+        if abs(math.degrees(xe)) > hw or abs(math.degrees(yn)) > hw:
+            continue
+        try:
+            v = float(x[col["Visual magnitude (V)"]])
+        except (ValueError, TypeError):
+            v = None
+        objs.append({"name": x[0].strip(), "ra_deg": round(ora, 5), "dec_deg": round(odec, 5), "v": v,
+                     "east_arcmin": round(math.degrees(xe) * 60, 2), "north_arcmin": round(math.degrees(yn) * 60, 2),
+                     "rate_ra_arcsec_h": _num(x[col['RA rate ("/h)']]), "rate_dec_arcsec_h": _num(x[col['Dec rate ("/h)']])})
+    objs.sort(key=lambda o: 99 if o["v"] is None else o["v"])
+    out = {"count": len(objs), "objects": objs[:60], "time_utc": t.strftime("%Y-%m-%d %H:%M:%S"), "half_width_deg": hw,
+           "source": "NASA/JPL Small-Body Identification API (first pass, ~1 arcmin)"}
+    if len(_ident_cache) > 300:
+        _ident_cache.clear()
+    _ident_cache[key] = out
+    return jsonify(out)
 
 
 if __name__ == "__main__":
-    start_dwarf_fetch()                      # background: dwarf-planet orbits from JPL Horizons
+    print("XARVIS running: viewer http://127.0.0.1:5000/  ·  about page http://127.0.0.1:5000/about")
+    threading.Thread(target=load_ephemeris, daemon=True).start()       # the first run downloads the 32 MB kernel
     app.run(debug=True, use_reloader=False, port=5000)

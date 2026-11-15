@@ -20,6 +20,10 @@ from .plots import LiveView, show_motion, show_spectrum, show_time_series, show_
 from .results import save_results
 from .stars import catalog_sed, contamination_check, position_at, positions_at, resolve_star
 from .target import find_tracked_object
+<<<<<<< HEAD
+=======
+
+>>>>>>> c1d8aa66f425c25a7bebed24e1ed90e62e8a42ab
 
 MID_DATA_MJD = 61000.0          # ~2025-11, middle of the SPHEREx data so far: where to search for a moving star
 
