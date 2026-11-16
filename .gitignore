@@ -1,4 +1,6 @@
 __pycache__/
 *.py[cod]
+.venv/
 .DS_Store
-results/
+# created by running analyses (pipeline result tables, and summary.json + PNG frames per web job)
+/results/
