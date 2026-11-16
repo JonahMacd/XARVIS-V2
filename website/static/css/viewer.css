@@ -209,8 +209,9 @@ button.danger.confirm { background:#ff6b5a; border-color:#ff6b5a; color:#02040a;
 #tlKey .bar { display:inline-block; width:70px; height:8px; vertical-align:0; margin:0 4px; background:linear-gradient(90deg,#80a8ff,#bdd6ff,#ffeed1,#ffb36b,#ff6b47); }
 #ana .anaBtns { display:flex; gap:8px; justify-content:flex-end; margin-top:8px; padding-top:8px; border-top:1px solid var(--line); }
 /* time bar: where the time shown is within the SPHEREx data, next to Live; and locked while an analysis runs */
-.edgeTag { display:inline-flex; align-items:center; justify-content:center; gap:4px; height:34px; min-width:112px; padding:0 9px; border:1px solid #34436a; border-radius:2px;
+.edgeTag { display:inline-flex; align-items:center; justify-content:center; gap:4px; height:34px; flex:none; padding:0 9px; border:1px solid #34436a; border-radius:2px;
            font-size:10.5px; font-weight:700; letter-spacing:.08em; text-transform:uppercase; white-space:nowrap; color:var(--dim); }
+.edgeTag .short { display:none; }
 .edgeTag.start { color:#02040a; background:var(--warn); border-color:var(--warn); }
 .edgeTag.end { color:#02040a; background:#5fe0a0; border-color:#5fe0a0; }
 #timebar.locked .tctl > :not(.edgeTag) { opacity:.38; pointer-events:none; }
@@ -275,7 +276,18 @@ button.danger.confirm { background:#ff6b5a; border-color:#ff6b5a; color:#02040a;
 #coordsBody .v { display:flex; justify-content:space-between; gap:10px; font-size:12.5px; line-height:17px; white-space:nowrap; } #coordsBody .v span:first-child { color:var(--dim); }
 #timebar .tctl { height:34px; display:flex; gap:8px; align-items:center; justify-content:center; }
 #timebar .tctl button, #timebar select, #timebar input { height:34px; }
-#timebar .play { display:flex; } #timebar .play button { padding:0 10px; min-width:38px; } #dateIn { width:170px; } #speed { min-width:128px; }
+/* the controls share the time bar's width: the buttons and the tag keep their size, the menus and the date box give way (never the other way round) */
+#timebar { container:timebar / inline-size; }
+#timebar .tctl > * { flex:none; }
+#timebar .play { display:flex; } #timebar .play button { padding:0 10px; min-width:38px; }
+#timebar #speed { flex:0 1 128px; min-width:84px; width:auto; }
+#timebar #dateIn { flex:0 1 170px; min-width:148px; width:auto; }
+#timebar #jump { flex:0 1 128px; min-width:84px; width:auto; }
+@container timebar (max-width: 820px) {                  /* narrow: the short tag wording and tighter buttons */
+  .edgeTag .long { display:none; } .edgeTag .short { display:inline; } .edgeTag { padding:0 8px; }
+  #timebar .play button { padding:0 8px; min-width:34px; }
+  #timebar .tctl { gap:6px; }
+}
 #zoomctl { height:34px; display:flex; gap:6px; }
 #zoomctl button { flex:1 1 0; min-width:0; padding:0; height:34px; font-size:10.5px; letter-spacing:.02em; }
 #zoombox .h input[type=range] { flex:1; min-width:60px; max-width:150px; height:14px; margin:0; }
@@ -287,7 +299,6 @@ button.danger.confirm { background:#ff6b5a; border-color:#ff6b5a; color:#02040a;
 #links .lk.main:hover { border-color:var(--esa); }
 #links .ext { font-size:11px; margin-left:2px; color:var(--esa); }
 #links .grow { flex:1; } #links .lbl { color:var(--dim); font-size:10.5px; text-transform:uppercase; letter-spacing:.12em; margin-right:2px; }
-@media (max-width:1240px) { #dateIn { width:150px; } #speed { min-width:110px; } }
 @media (max-width:1270px) {                             /* tablets: time on its own row, cursor and zoom side by side */
   #brand { max-height:calc(100vh - 236px); } #tools { max-height:calc(100vh - 236px); }
   #dock { left:10px; right:10px; bottom:10px; grid-template-columns:1fr 1fr; }
@@ -296,12 +307,11 @@ button.danger.confirm { background:#ff6b5a; border-color:#ff6b5a; color:#02040a;
 @media (max-width:600px) {                             /* phones: hover read-out is useless on touch, so drop it */
   #brand, #tools { max-height:calc(100vh - 330px); }
   #dock { grid-template-columns:1fr; } #dock #coords { display:none; } #dock #zoombox { border-left:0; }
-  #timebar .tctl { flex-wrap:wrap; height:auto; } #dateIn { width:150px; } #links { flex-wrap:wrap; white-space:normal; } #links .grow { display:none; }
+  #timebar .tctl { flex-wrap:wrap; height:auto; } #links { flex-wrap:wrap; white-space:normal; } #links .grow { display:none; }
 }
 #timebar .hhr { display:flex; align-items:center; gap:10px; } #tSpan { color:#8fa3cf; }
-#jump { width:128px; }
 /* medium screens: narrower side panels and controls so everything stays on one row */
-@media (max-width:1400px) { #speed { min-width:100px; width:104px; } #jump { width:112px; } #dateIn { width:150px; } .edgeTag { min-width:0; padding:0 7px; font-size:10px; letter-spacing:.03em; } }
+@media (max-width:1400px) { .edgeTag { font-size:10px; letter-spacing:.03em; } }
 @media (max-width:1300px) { #dock { grid-template-columns:312px minmax(0, 1fr) 252px; } #dock .h { letter-spacing:.12em; } }
 @media (max-width:1270px) { #dock { grid-template-columns:1fr 1fr; } }
 @media (max-width:600px) { #dock { grid-template-columns:1fr; } #tSpan { display:none; } }
