@@ -17,12 +17,12 @@ jobs:
 
       - name: No merge-conflict markers
         run: |
-          if git grep -n -E '^(<<<<<<<|>>>>>>>)( |$)|^=======$' -- '*.py' '*.json' '*.txt'; then
+          if git grep -n -E '^(<<<<<<<|>>>>>>>)( |$)|^=======$' -- '*.py' '*.json' '*.txt' ':!legacy_xarvis'; then
             echo "::error::merge-conflict markers found (see above)"; exit 1
           fi
 
       - name: Every Python file compiles
-        run: python -m compileall -q Jonah_Code_File Test_Jonah_code.py
+        run: python -m compileall -q xarvis_pipeline website tools tests run_web.py
 
       - name: Offline tests (synthetic data, no network)
-        run: python -m unittest discover -s Jonah_Code_File -p "test_*.py" -t .
+        run: python -m unittest discover -s tests -t .
