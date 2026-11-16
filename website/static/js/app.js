@@ -79,7 +79,10 @@ function updateUI() {
   const edge = atStart ? 'start' : atEnd ? 'end' : 'mid';
   if (tag.dataset.edge !== edge || edge === 'mid') {
     tag.dataset.edge = edge; tag.className = 'edgeTag ' + edge;
-    tag.textContent = atStart ? '⏮ Start of data' : atEnd ? (sim.live ? 'End of data · now' : 'End of data ⏭') : `${Math.round(100*(jd - first)/(lastJD - first))}% through data`;
+    const pct = Math.round(100*(jd - first)/(lastJD - first));          // a long and a short wording: the time bar shows the short one when it is narrow
+    const long = atStart ? '⏮ Start of data' : atEnd ? (sim.live ? 'End of data · now' : 'End of data ⏭') : `${pct}% through data`;
+    const short = atStart ? '⏮ Start' : atEnd ? (sim.live ? 'Now' : 'End ⏭') : `${pct}%`;
+    tag.innerHTML = `<span class="long">${long}</span><span class="short">${short}</span>`;
     tag.title = atStart ? 'The first SPHEREx science data (' + utc(first) + '): there is nothing earlier' : atEnd ? 'The latest SPHEREx data (' + utc(lastJD) + '): there is nothing later yet' : 'Between the first (' + utc(first) + ') and the latest (' + utc(lastJD) + ') SPHEREx data';
   }
   if (!$('advScroll').hidden) setHTML('adv', advancedHTML(sp));

@@ -41,7 +41,7 @@ function drawVisibility() {
   const g = visGeom(), SK = skyScale(), cell = 6, gw = Math.ceil(W/cell), gh = Math.ceil(H/cell);
   if (visCv.width !== gw || visCv.height !== gh) { visCv.width = gw; visCv.height = gh; }
   const img = visCtx.createImageData(gw, gh), d = img.data, R0 = R[0], R1 = R[1], R2 = R[2];
-  let cx = 0, cy = 0, cn = 0; const rho = Math.acos(g.cosRho);
+  const rho = Math.acos(g.cosRho);
   for (let j = 0; j < gh; j++) for (let i = 0; i < gw; i++) {
     const u = ((i + 0.5)*cell - W/2)/SK, v = -((j + 0.5)*cell - H/2)/SK, r2 = u*u + v*v, k = 2/(1 + r2), a = u*k, b = v*k, c = -(1 - r2)/(1 + r2);
     const x = R0[0]*a + R1[0]*b + R2[0]*c, y = R0[1]*a + R1[1]*b + R2[1]*c, z = R0[2]*a + R1[2]*b + R2[2]*c;   // view -> ecliptic direction
@@ -53,19 +53,73 @@ function drawVisibility() {
     const aAll = opt.cVisAll ? 16 : 0, al = opt.cVisNow ? cSun*(34*cNow + aAll*(1 - cNow)) : cSun*aAll;   // 34 = visible now, 16 = Sun limit only
     if (al < 0.5) continue;
     const o = (j*gw + i)*4; d[o] = 0; d[o+1] = 181; d[o+2] = 226; d[o+3] = Math.round(al);
-    if (opt.cVisNow && cNow*cSun > 0.5) { cx += i; cy += j; cn++; }
   }
   visCtx.putImageData(img, 0, 0);
   ctx.save(); ctx.imageSmoothingEnabled = true; ctx.drawImage(visCv, 0, 0, gw*cell, gh*cell); ctx.restore();
   ctx.lineWidth = 1.2;
   if (opt.cVisAll) { ctx.strokeStyle = '#ff9d6bcc'; ctx.setLineDash([7, 6]); ctx.beginPath(); drawGreatPath(smallCircle(g.sun, SUN_LIMIT_DEG, 180), SK); ctx.stroke(); ctx.setLineDash([]); }
-  if (opt.cVisNow && cn > 20) { ctx.fillStyle = '#5fd6f0'; placeLabel('SPHEREx can see now', '12px system-ui', (cx/cn + 0.5)*cell, (cy/cn + 0.5)*cell, [[w => -w/2, 4], [w => -w/2, -20], [w => -w/2, 28]]); }
+  if (opt.cVisNow) drawVisLabel(g, SK);
+}
+// The "SPHEREx can see now" label belongs to the Visible now layer alone: it is on exactly when that layer is, whatever
+// else is switched on. It is pinned to the middle of the region on the SKY: the direction opposite the Sun, the centre of
+// the half of the sky that is at least 91 degrees from it. That point moves only as slowly as the Sun does. (It used to follow
+// the centre of whatever part of the region was on screen, which swings wildly as SPHEREx circles Earth - 98 minutes per
+// orbit, 15 orbits per second at 1 day/s - and it was placed among the constellation names' rectangles.)
+// Where Earth is covering that point right now, the label slides along the sky just clear of Earth's edge, so it always
+// stands on sky that can really be seen, and it moves smoothly as Earth passes (never a jump).
+const LABEL_EDGE_MARGIN = 6*D2R;
+function visCentre(g) {
+  const a = [-g.sun[0], -g.sun[1], -g.sun[2]], e = g.toE, rho = Math.acos(g.cosRho), limit = rho + LABEL_EDGE_MARGIN, cosA = clamp(dot(a, e), -1, 1);
+  if (Math.acos(cosA) >= limit) return a;                                                  // not under Earth: the middle of the region
+  let t = [a[0] - cosA*e[0], a[1] - cosA*e[1], a[2] - cosA*e[2]], tn = Math.hypot(...t);
+  if (tn < 1e-4) { t = cross(e, g.sun); tn = Math.hypot(...t); }                         // Earth exactly behind it: slide sideways
+  t = [t[0]/tn, t[1]/tn, t[2]/tn];
+  const c = [Math.cos(limit)*e[0] + Math.sin(limit)*t[0], Math.cos(limit)*e[1] + Math.sin(limit)*t[1], Math.cos(limit)*e[2] + Math.sin(limit)*t[2]];
+  return dot(c, g.sun) <= COS_SUN ? c : null;                                                // (always 91+ degrees from the Sun for SPHEREx's real orbit)
+}
+const visLabel = {rect: null, slot: 0, ui: [], dir: null, t: 0};   // last frame's rectangle (the names keep clear of it), the spot used, the panels, the smoothed sky position
+const LABEL_MARGIN = 28;          // px kept clear between the label and the edge of the screen
+const LABEL_SMOOTH_S = 0.25;      // seconds: much faster than the real orbit (98 min), so invisible at normal speeds, but it averages out the Earth sweeping past when time runs at days per second
+const LABEL_TEXT = 'SPHEREx can see now', LABEL_FONT = '12px system-ui', LABEL_DY = [4, -20, 28, -44, 52];     // spots, from the centre down and up
+function drawVisLabel(g, SK) {
+  visLabel.rect = null;
+  const c = visCentre(g); if (!c) { visLabel.dir = null; return; }
+  const now = performance.now(), dt = (now - visLabel.t)/1000; visLabel.t = now;
+  if (!visLabel.dir || dt > 1) visLabel.dir = c;               // first frame, or the layer was off: no gliding
+  else { const k = 1 - Math.exp(-dt/LABEL_SMOOTH_S), m = [0, 1, 2].map(i => visLabel.dir[i] + k*(c[i] - visLabel.dir[i])), n = Math.hypot(...m) || 1; visLabel.dir = [m[0]/n, m[1]/n, m[2]/n]; }
+  const a = visLabel.dir, w = measure(LABEL_FONT, LABEL_TEXT), h = 13;
+  const place = d => {                                       // where the label would stand on sky direction d: the first free spot, last frame's first
+    const q = skyXY(toView(d), SK); if (!q) return null;     // (behind the view: no spot)
+    for (let t = 0; t < LABEL_DY.length; t++) {
+      const s = (visLabel.slot + t) % LABEL_DY.length, lx = q[0] - w/2, ly = q[1] + LABEL_DY[s], r = [lx, ly - h + 2, lx + w, ly + 3];
+      if (r[0] >= LABEL_MARGIN && r[2] <= W - LABEL_MARGIN && r[1] >= LABEL_MARGIN && r[3] <= H - LABEL_MARGIN && !hitsRect(r, visLabel.ui)) return {lx, ly, r, s};     // on screen (not hugging the edge), not under a panel
+    }
+    return null;
+  };
+  let spot = place(a);
+  if (!spot) {            // its natural place is off screen or under a panel: slide along the sky toward what is at the middle of the screen, to
+                          // the first spot that is on screen and on sky that SPHEREx can really see now (moves smoothly with the view and the time)
+    const c0 = skyDirAt(W/2, H/2), cosW = c0 ? clamp(dot(a, c0), -1, 1) : 1, om = Math.acos(cosW), so = Math.sin(om);
+    if (c0 && so > 1e-3) {
+      const at = t => { const k1 = Math.sin((1 - t)*om)/so, k2 = Math.sin(t*om)/so; return [k1*a[0] + k2*c0[0], k1*a[1] + k2*c0[1], k1*a[2] + k2*c0[2]]; };
+      const good = t => { const d = at(t); return visibilityOf(d, g).visible_now ? place(d) : null; };
+      const N = 50; let lo = 0, hi = -1;
+      for (let i = 1; i <= N; i++) if (good(i/N)) { hi = i/N; lo = (i - 1)/N; break; }
+      if (hi >= 0) { for (let k = 0; k < 8; k++) { const mid = (lo + hi)/2; if (good(mid)) hi = mid; else lo = mid; } spot = good(hi); }
+    }
+  }
+  if (!spot) return;
+  visLabel.slot = spot.s; visLabel.rect = spot.r; labelRects.push(spot.r);
+  ctx.font = LABEL_FONT; ctx.fillStyle = '#5fd6f0'; ctx.fillText(LABEL_TEXT, spot.lx, spot.ly);
 }
 
 // ============================================================================ 3D drawing ===
 function draw3D() {
   const s = scaleOf(zt), c = centerOf(s), fade = constellationFade(s);
-  baseRects = uiReserved().slice();
+  visLabel.ui = uiReserved(); baseRects = visLabel.ui.slice();
+  if (!opt.cVisNow) visLabel.rect = null;
+  else if (visLabel.rect) baseRects.push(visLabel.rect);                   // the constellation names keep clear of the visible-region label
+  labelRects = baseRects.slice();                                          // start every frame clean, with or without the names layer (stale rectangles used to pile up)
   drawStarfield(0.75, fade);
   drawVisibility();
   drawSkyTarget();

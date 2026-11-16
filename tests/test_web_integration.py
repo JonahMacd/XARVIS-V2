@@ -551,6 +551,41 @@ def slow_analyse(started, release):
     return run
 
 
+class ViewerLayout(unittest.TestCase):
+    """Source-level guards for two viewer bugs (the browser behaviour itself was checked in a real browser)."""
+    STATIC = ROOT / 'website' / 'static'
+
+    def test_time_bar_tag_cannot_shrink_below_its_text(self):
+        """min-width:0 let the yellow START OF DATA tag collapse to 32 px at 1400 px and below, spilling its text over the
+        neighbouring boxes. It must keep its size (flex:none), have a short wording for narrow bars, and the menus and date
+        box must be the ones that give way."""
+        import re
+        css = (self.STATIC / 'css' / 'viewer.css').read_text(encoding='utf-8')
+        for rule in re.findall(r'[^{}]*\.edgeTag[^{}]*\{[^}]*\}', css):
+            self.assertNotIn('min-width:0', rule.replace(' ', ''), rule)
+        self.assertRegex(css, r'\.edgeTag \{[^}]*flex:none')
+        self.assertIn('@container timebar', css)
+        for control in ('#speed', '#dateIn', '#jump'):
+            self.assertRegex(css, re.escape('#timebar ' + control) + r' \{ flex:0 1 \d+px; min-width:\d+px')
+        app = (self.STATIC / 'js' / 'app.js').read_text(encoding='utf-8')
+        self.assertIn('class="long"', app)
+        self.assertIn('class="short"', app)
+
+    def test_visible_region_label_is_independent_of_the_constellations(self):
+        """The SPHEREx can see now label follows the Visible now layer only: it must not read the constellation layers or
+        share the names label placer, every frame must start with a clean list of reserved rectangles (stale ones used to
+        pile up while the names layer was off, so the label almost never appeared), and it is pinned to the sky rather than
+        to the centre of the visible part on screen (which swung wildly as Earth passed)."""
+        js = (self.STATIC / 'js' / 'view3d.js').read_text(encoding='utf-8')
+        body = js[js.index('function drawVisLabel'):js.index('// ====', js.index('function drawVisLabel'))]
+        for name in ('cNames', 'cLines', 'placeLabel(', 'drawNames'):
+            self.assertNotIn(name, body)
+        self.assertIn('if (opt.cVisNow) drawVisLabel(g, SK);', js)
+        self.assertIn('labelRects = baseRects.slice();', js[js.index('function draw3D'):])
+        self.assertNotIn('cx += i', js)                                            # the old on-screen centroid is gone
+        self.assertIn('visCentre', js)
+
+
 class OneAtATime(unittest.TestCase):
     """Only one analysis runs at a time; it can be stopped; "Stop & reset" and a new browser session clear everything."""
 
