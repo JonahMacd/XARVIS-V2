@@ -1,6 +1,20 @@
 {
- "source": "ESA Gaia DR3 (gea.esac.esa.int); WISE 0855 from the challenge text",
+ "source": "ESA Gaia DR3 (gea.esac.esa.int); WISE 0855 from the challenge text; 433 Eros from NASA/JPL",
  "targets": [
+  {
+   "name": "433 Eros",
+   "note": "near-Earth asteroid, the first one orbited by a spacecraft (NEAR Shoemaker)",
+   "track": {
+    "kind": "asteroid",
+    "name": "433 Eros",
+    "id": "433",
+    "window": [
+     "2026-02-15",
+     "2026-06-15"
+    ]
+   },
+   "source": "NASA/JPL Small-Body Database orbit; images followed along its NASA/JPL Horizons path"
+  },
   {
    "name": "Barnard's Star",
    "note": "red dwarf with the largest proper motion of any star",

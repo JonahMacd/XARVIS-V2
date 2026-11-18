@@ -25,6 +25,8 @@ import logging
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
+from pathlib import Path
 
 import numpy as np
 from astropy import units as u
@@ -41,7 +43,12 @@ from .measure import flag_bits, survey_visits
 log = logging.getLogger(__name__)
 
 HIP_EPOCH_MJD = 48348.5625                  # Hipparcos (new reduction) positions are for J1991.25
-VIZIER_URL = 'https://vizier.cfa.harvard.edu/viz-bin/asu-tsv'
+J2000_MJD = 51544.5
+NAMED_STARS_FILE = Path(__file__).parent / 'data' / 'named_stars.json'   # tools/build_named_stars.py
+HIP_MAX_PM_ARCSEC_YR = 11.0                 # the fastest Hipparcos star (Barnard's Star) moves 10.4"/yr
+# VizieR: the main server (CDS, Strasbourg) first, then its Harvard mirror. Either can be up but have its database
+# down, and then answers HTTP 200 with 'QUERY_STATUS=ERROR' and no rows (measured at Harvard, Nov 2026)
+VIZIER_URLS = ('https://vizier.cds.unistra.fr/viz-bin/asu-tsv', 'https://vizier.cfa.harvard.edu/viz-bin/asu-tsv')
 STELLARIUM_URL = 'https://raw.githubusercontent.com/Stellarium/stellarium/master/skycultures/modern/index.json'
 SBDB_URL = 'https://ssd-api.jpl.nasa.gov/sbdb.api'
 PLANETS = ('mercury', 'venus', 'mars', 'jupiter', 'saturn', 'uranus', 'neptune', 'moon')
@@ -50,16 +57,36 @@ ARTIFACT_FLAGS = ('GHOST', 'GHOST_FPA', 'GHOST_EXT', 'CROSSTALK', 'PERSIST', 'ST
                   'OUTLIER', 'OVERFLOW', 'SUR_ERROR', 'BLOOM', 'HOT', 'COLD', 'NONFUNC', 'MISSING_DATA', 'NONLINEAR')
 
 
-def _get(kind, key_parts, url, params=None, label='request'):
-    """GET through net.py (the service's retries and limits), cached on disk under `kind`."""
+def _get(kind, key_parts, url, params=None, label='request', check=None):
+    """GET through net.py (the service's retries and limits), cached on disk under `kind` (only answers that pass
+    `check`, see net.get)."""
     service = 'jpl' if 'jpl.nasa.gov' in url else 'github' if 'github' in url else 'cds'
-    return net.get(url, params, service=service, label=label, cache_kind=kind, timeout=60,
+    return net.get(url, params, service=service, label=label, cache_kind=kind, timeout=60, check=check,
                    cache_key=cache.make_key(url, *sorted((params or {}).items()), *key_parts))
+
+
+def _check_vizier(content):
+    """A VizieR answer that is really an error ('The database is not currently reachable', with HTTP 200) or not a
+    table at all: retried, never cached - else a field would keep 'no Hipparcos stars' (so no star names) forever."""
+    if b'QUERY_STATUS=ERROR' in content or b'#INFO\tError=' in content or b'#Column' not in content:
+        first = next((line for line in content.decode(errors='replace').splitlines() if 'Error=' in line), 'not a table')
+        raise net.BadResponse(f'VizieR error: {first.split("Error=")[-1].strip()[:80]}')
 
 
 # ----------------------------------------------------------------------------
 # Stars: Hipparcos + Stellarium names + Gaia DR3 + CatWISE
 # ----------------------------------------------------------------------------
+
+@lru_cache(maxsize=1)
+def named_stars():
+    """Every star with a common name (Stellarium) with its Gaia DR3 id (None if too bright for Gaia), J2000 position,
+    proper motion and V magnitude - built into XARVIS (data/named_stars.json), so no network is needed to name them."""
+    try:
+        return tuple(json.loads(NAMED_STARS_FILE.read_text(encoding='utf-8'))['stars'])
+    except (OSError, ValueError, KeyError) as e:
+        log.info(f'  (built-in star names not available: {e})')
+        return ()
+
 
 def star_names():
     """{HIP number: common name} from Stellarium's 'modern' sky culture (e.g. 32349: 'Sirius')."""
@@ -78,7 +105,17 @@ def hipparcos(coord, radius):
     params = {'-source': 'I/311/hip2', '-c': f'{coord.ra.deg:.6f} {coord.dec.deg:+.6f}',
               '-c.rs': f'{radius.to_value(u.arcsec):.0f}', '-out': 'HIP,RArad,DErad,pmRA,pmDE,Plx,Hpmag',
               '-out.max': '500'}
-    text = _get('catalogs', [], VIZIER_URL, params, 'Hipparcos').decode()
+    text, last = None, None
+    for url in VIZIER_URLS:
+        try:
+            # 'v2': answers cached before the error check (possibly an error stored as 'no stars') are not reused
+            text = _get('catalogs', ['v2'], url, params, 'Hipparcos', check=_check_vizier).decode()
+            break
+        except (RuntimeError, net.Refused) as e:
+            last = e
+            log.info(f'  (Hipparcos at {url.split("/")[2]} not available, {"trying the next server" if url != VIZIER_URLS[-1] else "no more servers"})')
+    if text is None:
+        raise RuntimeError(f'Hipparcos: no VizieR server answered ({last})')
     rows = []
     for line in text.splitlines():
         parts = line.split('\t')
@@ -90,27 +127,52 @@ def hipparcos(coord, radius):
     return Table(rows=rows or None, names=('hip', 'ra', 'dec', 'pmra', 'pmdec', 'parallax', 'hp'))
 
 
-def catalog_layer(coord, radius=None, *, field=None):
-    """All catalog stars around `coord`, one row each, with the best name: Stellarium name (+HIP), HIP number,
-    Gaia DR3 id or CatWISE name. Columns as field.query_field, plus 'label' and 'hip' (0 = none)."""
+def _years_since(mjd):
+    return max((Time.now().mjd - mjd) / 365.25, 0.0)
+
+
+def target_label(target):
+    """{Gaia DR3 id: name} for the analysed star (`star` as stars.positions_at takes it), when it is a named Gaia
+    star (e.g. a website target, {'query': '4472832130942575872', 'name': "Barnard's Star"}); else {}."""
+    query = str((target or {}).get('query') or '').replace('Gaia DR3', '').strip()
+    name = str((target or {}).get('name') or '').strip()
+    if not query.isdigit() or not name or name.startswith('RA ') or name.startswith('Gaia DR3'):
+        return {}
+    return {query: name}
+
+
+def catalog_layer(coord, radius=None, *, field=None, target=None):
+    """All catalog stars around `coord`, one row each, with the best name, in this order: Stellarium name (+HIP),
+    the analysed target's own name (`target`, see target_label), HIP number, and only then the Gaia DR3 id or
+    CatWISE name. Columns as field.query_field, plus 'label', 'hip' (0 = none) and 'named' (a real name, not
+    just a catalog number)."""
     radius = radius if radius is not None else cfg.FIELD_RADIUS
     if field is None:
         field = query_field(coord, radius, quiet=True)
     else:
         field = field.copy()  # retain the original shared catalog unchanged
     try:
-        hip, names = hipparcos(coord, radius), star_names()
+        # Hipparcos positions are for J1991.25: a fast star's catalog position can be far outside the field
+        # today (Barnard's Star: ~6' by 2025), so search wider, then keep the stars that are in the field now
+        pad = HIP_MAX_PM_ARCSEC_YR * _years_since(HIP_EPOCH_MJD) * u.arcsec
+        hip, names = hipparcos(coord, radius + pad), star_names()
     except RuntimeError as e:
         log.info(f'  (Hipparcos / Stellarium names not available: {e})')
         hip, names = Table(names=('hip', 'ra', 'dec', 'pmra', 'pmdec', 'parallax', 'hp')), {}
-    rows = [dict(zip(field.colnames, [r[c] for c in field.colnames]), label=str(r['name']), hip=0) for r in field]
+    rows = [dict(zip(field.colnames, [r[c] for c in field.colnames]), label=str(r['name']), hip=0, named=False)
+            for r in field]
+    n_hip, n_named = 0, 0
+    near = radius + HIP_MAX_PM_ARCSEC_YR * _years_since(GAIA_EPOCH_MJD) * u.arcsec   # (as far as one moved since)
     gaia = [k for k, r in enumerate(rows) if r['source'] == 'Gaia']
     for star in hip:
         # Hipparcos position moved to the Gaia epoch, then the same star found in Gaia (if Gaia has it)
         years = (GAIA_EPOCH_MJD - HIP_EPOCH_MJD) / 365.25
         dec = star['dec'] + star['pmdec'] * years / 3.6e6
         ra = star['ra'] + star['pmra'] * years / 3.6e6 / np.cos(np.radians(dec))
+        if coord.separation(SkyCoord(ra * u.deg, dec * u.deg)) > near:
+            continue                                # (found only because of the wider search)
         name = names.get(int(star['hip']))
+        n_hip, n_named = n_hip + 1, n_named + bool(name)
         label = f"{name} (HIP {star['hip']})" if name else f"HIP {star['hip']}"
         best, best_sep = None, 1.5
         for k in gaia:
@@ -118,17 +180,57 @@ def catalog_layer(coord, radius=None, *, field=None):
             if sep < best_sep:
                 best, best_sep = k, sep
         if best is not None:
-            rows[best].update(label=label, hip=int(star['hip']))
+            rows[best].update(label=label, hip=int(star['hip']), named=bool(name))
         else:                                       # too bright for Gaia: keep Hipparcos's own entry
             rows.append({'source': 'Hipparcos', 'name': f"HIP {star['hip']}", 'ra': float(star['ra']),
                          'dec': float(star['dec']), 'pmra': float(star['pmra']), 'pmdec': float(star['pmdec']),
                          'epoch_mjd': HIP_EPOCH_MJD, 'mag': float(star['hp']), 'parallax': float(star['parallax']),
-                         'gaia_match': False, 'label': label, 'hip': int(star['hip'])})
+                         'gaia_match': False, 'label': label, 'hip': int(star['hip']), 'named': bool(name)})
+    # the built-in named stars (named_stars): by Gaia DR3 id - exact, whatever the epoch - or, too bright for Gaia,
+    # by HIP number / position. Works even when VizieR / Stellarium can't be reached (they are often down).
+    known = named_stars()
+    by_gaia = {f"Gaia DR3 {s['gaia_dr3']}": s for s in known if s['gaia_dr3']}
+    by_hip = {s['hip']: s for s in known}
+    for row in rows:
+        star = by_gaia.get(row['name']) if row['source'] == 'Gaia' else None
+        star = star or (by_hip.get(row['hip']) if row['hip'] else None)
+        if star and not row['named']:
+            if row['hip'] and row['hip'] != star['hip']:
+                continue                                # (VizieR matched a different HIP star: keep that)
+            n_hip += not row['hip']
+            n_named += 1
+            row.update(label=f"{star['name']} (HIP {star['hip']})", hip=star['hip'], named=True)
+    have = {r['hip'] for r in rows if r['hip']}
+    for star in known:                              # no Gaia id (too bright for Gaia) and not from VizieR
+        if star['gaia_dr3'] or star['hip'] in have:
+            continue
+        def moved(mjd):
+            years = (mjd - J2000_MJD) / 365.25
+            dec = star['dec'] + star['pmdec'] * years / 3.6e6
+            return star['ra'] + star['pmra'] * years / 3.6e6 / np.cos(np.radians(dec)), dec
+        if coord.separation(SkyCoord(*moved(Time.now().mjd), unit='deg')) > radius:
+            continue
+        n_hip, n_named = n_hip + 1, n_named + 1
+        label = f"{star['name']} (HIP {star['hip']})"
+        ra, dec = moved(GAIA_EPOCH_MJD)             # a Gaia entry for it after all (SIMBAD lists no id): name that
+        near_gaia = [k for k in gaia if not rows[k]['hip'] and
+                     np.hypot((rows[k]['ra'] - ra) * np.cos(np.radians(dec)), rows[k]['dec'] - dec) * 3600 < 1.5]
+        if near_gaia:
+            rows[near_gaia[0]].update(label=label, hip=star['hip'], named=True)
+            continue
+        rows.append({'source': 'Hipparcos', 'name': f"HIP {star['hip']}", 'ra': star['ra'], 'dec': star['dec'],
+                     'pmra': star['pmra'], 'pmdec': star['pmdec'], 'epoch_mjd': J2000_MJD,
+                     'mag': star['vmag'] if star['vmag'] is not None else 0.0, 'parallax': 0.0,
+                     'gaia_match': False, 'label': label, 'hip': star['hip'], 'named': True})
+    for gaia_id, name in target_label(target).items():   # the analysed star, by its own name (if no common name)
+        for row in rows:
+            if row['source'] == 'Gaia' and row['name'] == f'Gaia DR3 {gaia_id}' and not (row['hip'] and '(' in row['label']):
+                row.update(label=f"{name} (HIP {row['hip']})" if row['hip'] else name, named=True)
     if not rows:
         field['label'], field['hip'] = np.array([], dtype=str), np.array([], dtype=int)
+        field['named'] = np.array([], dtype=bool)
     table = Table(rows=rows) if rows else field
-    n_named = sum(1 for r in rows if r['hip'] and '(' in r['label'])
-    log.info(f"Star catalogs: {sum(r['source'] == 'Gaia' for r in rows)} Gaia DR3, {len(hip)} Hipparcos "
+    log.info(f"Star catalogs: {sum(r['source'] == 'Gaia' for r in rows)} Gaia DR3, {n_hip} Hipparcos "
           f"({n_named} with a common name), {sum(r['source'] == 'CatWISE' and not r['gaia_match'] for r in rows)} "
           f"CatWISE-only sources within {radius.to_value(u.arcmin):.1f}'")
     return table
@@ -303,12 +405,19 @@ def _artifact_flags(frame, x, y, radius=2):
     return [name for name in ARTIFACT_FLAGS if flag_bits(header, {name}) and (box & flag_bits(header, {name})).any()]
 
 
+def _named(catalog):
+    """Which catalog rows have a real name to print (a Hipparcos star or the analysed target; catalog_layer).
+    (A catalog table made elsewhere may have no 'named' column: then the Hipparcos stars.)"""
+    hip = np.asarray(catalog['hip']) > 0
+    return hip | np.asarray(catalog['named'], dtype=bool) if 'named' in catalog.colnames else hip
+
+
 def map_frames(frames, catalog, bodies, planets):
     """Identify every detected source in every frame (needs the full pixels). Stores frame['map'] - a list of
     entries {kind, label, ra, dec, detected, ...} in sky coordinates, so it can be drawn on any view - and
     returns the unexplained detections [(frame index, ra, dec, significance, mover flags), ...] for classify_new."""
     unexplained = []
-    labels = np.asarray(catalog['label'])
+    labels, named = np.asarray(catalog['label']), _named(catalog)
     for i, frame in enumerate(frames):
         result = compare_frame(frame, catalog)
         entries = []
@@ -319,13 +428,13 @@ def map_frames(frames, catalog, bodies, planets):
         in_view = (cx > -0.5) & (cx < nx - 0.5) & (cy > -0.5) & (cy < ny - 0.5)
         seen = np.zeros(len(catalog), dtype=bool)
         seen[result['cat_index'][result['cat_seen']]] = True
-        for k in np.flatnonzero(in_view & (seen | (np.asarray(catalog['hip']) > 0))):
+        for k in np.flatnonzero(in_view & (seen | named)):
             row = catalog[k]
             if row['source'] == 'CatWISE' and row['gaia_match']:
                 continue                                  # the same star as a Gaia entry
             entries.append({'kind': 'star', 'source': str(row['source']), 'label': str(labels[k]),
                             'ra': float(ra[k]), 'dec': float(dec[k]), 'detected': bool(seen[k]),
-                            'named': bool(row['hip']), 'mag': float(row['mag']), 'catalog_row': int(k)})
+                            'named': bool(named[k]), 'mag': float(row['mag']), 'catalog_row': int(k)})
         # known solar-system objects at this frame's time
         used = np.zeros(len(result['peak_x']), dtype=bool)
         for body in bodies:
@@ -507,7 +616,8 @@ def _mark_as_star(frames, detections, catalog, row):
         entries[:] = [e for e in entries if not (e.get('kind') == 'star' and e.get('catalog_row') == row)]
         ra, dec = field_positions(catalog[row:row + 1], frame['mjd'])
         entries.append({'kind': 'star', 'source': str(catalog['source'][row]), 'label': str(catalog['label'][row]),
-                        'ra': float(ra[0]), 'dec': float(dec[0]), 'detected': True, 'named': bool(catalog['hip'][row]),
+                        'ra': float(ra[0]), 'dec': float(dec[0]), 'detected': True,
+                        'named': bool(_named(catalog[row:row + 1])[0]),
                         'mag': float(catalog['mag'][row]), 'catalog_row': row})
 
 
@@ -853,11 +963,12 @@ def _describe_kind(obj):
 # Everything together, and the output table
 # ----------------------------------------------------------------------------
 
-def map_sky(frames, coord, *, field=None):
-    """Map every object in the frames around `coord` (needs the full pixels: before make_zooms).
+def map_sky(frames, coord, *, field=None, target=None):
+    """Map every object in the frames around `coord` (needs the full pixels: before make_zooms). `target`: the
+    analysed star, named by its own name on the map (catalog_layer).
     Returns {'catalog', 'bodies', 'planets', 'new_objects'}; frame['map'] holds each frame's objects."""
     radius = cfg.ZOOM_SIZE_PIX / 2 * np.sqrt(2) * cfg.PIXEL_ARCSEC / 3600 + 0.01        # covers the cutouts
-    catalog = catalog_layer(coord, field=field)
+    catalog = catalog_layer(coord, field=field, target=target)
     mjd = np.array([f['mjd'] for f in frames])
     planets = planets_in_view(coord, mjd, radius)
     if planets:

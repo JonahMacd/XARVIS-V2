@@ -309,6 +309,9 @@ def map_marks(zoom, north, factor):
             marks.append({'id': object_id(entry), 'kind': entry['kind'], 'source': entry.get('source'),
                           'label': entry['label'], 'named': bool(entry.get('named')),
                           'detected': bool(entry.get('detected', True)), 'x': round(float(x), 1), 'y': round(float(y), 1)})
+            mag = entry.get('mag')
+            if mag is not None and np.isfinite(mag):       # the browser names the brightest +/x stars first
+                marks[-1]['mag'] = round(float(mag), 2)
     parts = [f'{counts[key]} {label}' for key, label in MAP_COUNTS if counts.get(key)]
     return marks, 'mapped: ' + (', '.join(parts) or 'nothing detected')
 

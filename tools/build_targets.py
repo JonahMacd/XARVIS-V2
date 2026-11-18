@@ -4,7 +4,9 @@
 Each target is found with a small cone search in the ESA Gaia archive around its approximate position, and the brightest
 (or, for a high proper-motion star, the fastest) source in the cone is taken. The viewer then moves each star from Gaia's
 epoch (J2016.0) to the date shown. WISE 0855-0714 is too faint for Gaia: its coordinates are the ones given in the
-NASA Space Apps challenge text, with no proper motion.
+NASA Space Apps challenge text, with no proper motion. 433 Eros is an asteroid: it has no fixed position, so the website
+places it with its JPL orbit (static/small_bodies.json) and the analysis follows it along its NASA/JPL Horizons path
+('track'; the window is the one results.DEFAULT_OBJECTS uses).
 
 Usage:  python tools/build_targets.py --out website/static/targets.json
 Needs:  requests, and access to gea.esac.esa.int (ESA Gaia archive TAP service)
@@ -25,6 +27,9 @@ TARGETS = [
 WISE0855 = {"name": "WISE 0855-0714", "note": "fast-moving brown dwarf, the coldest known; too faint for Gaia",
             "ra": (8 + 55 / 60 + 10.831 / 3600) * 15, "dec": -(7 + 14 / 60 + 42.53 / 3600), "epoch": None, "pmra": None, "pmdec": None,
             "parallax": None, "g": None, "source": "coordinates from the NASA Space Apps Challenge 2026 text (RA 08h55m10.831s, Dec -7d14m42.53s)"}
+EROS = {"name": "433 Eros", "note": "near-Earth asteroid, the first one orbited by a spacecraft (NEAR Shoemaker)",
+        "track": {"kind": "asteroid", "name": "433 Eros", "id": "433", "window": ["2026-02-15", "2026-06-15"]},
+        "source": "NASA/JPL Small-Body Database orbit; images followed along its NASA/JPL Horizons path"}
 
 
 def cone(ra, dec, r):
@@ -53,7 +58,8 @@ def main():
         out.append({"name": name, "note": note, "ra": s["ra"], "dec": s["dec"], "epoch": s["ref_epoch"], "pmra": s["pmra"], "pmdec": s["pmdec"],
                     "parallax": s["parallax"], "g": round(s["phot_g_mean_mag"], 3), "gaia_dr3": str(s["source_id"]), "source": "ESA Gaia DR3"})
     out.insert(2, WISE0855)
-    json.dump({"source": "ESA Gaia DR3 (gea.esac.esa.int); WISE 0855 from the challenge text", "targets": out}, open(a.out, "w"), indent=1)
+    out.insert(0, EROS)
+    json.dump({"source": "ESA Gaia DR3 (gea.esac.esa.int); WISE 0855 from the challenge text; 433 Eros from NASA/JPL", "targets": out}, open(a.out, "w"), indent=1)
     print("wrote", a.out)
 
 

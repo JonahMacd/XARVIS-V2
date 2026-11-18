@@ -66,6 +66,7 @@
     <label><input type="checkbox" id="cStars" checked>Stars</label>
     <label><input type="checkbox" id="cLines">Constellations &amp; names</label>
     <label><input type="checkbox" id="cOrbits" checked>Orbits</label>
+    <label title="Every object in Track objects: its path across the sky as seen from Earth, 60 days either side of the date shown (a dot every 10 days; hover one for its date)"><input type="checkbox" id="cTrackPath" checked><i class="sw path"></i>Sky paths of tracked objects</label>
     <label><input type="checkbox" id="cBelts" checked>Asteroids &amp; Kuiper belt</label>
     <div class="grp">What SPHEREx can see</div>
     <label title="Sky SPHEREx can point at right now: at least 91° from the Sun and not behind Earth"><input type="checkbox" id="cVisNow" checked><i class="sw now"></i>Visible now</label>
@@ -208,6 +209,7 @@
 <div id="anaMini" hidden><button id="anaMiniOpen" title="Open the analysis"><span id="anaMiniIcon" class="spin" aria-hidden="true"></span><span><b id="anaMiniTitle">SPHEREx analysis</b><span id="anaMiniText" class="dim"></span></span></button><button id="anaMiniX" class="ghost" title="Close (a running analysis is stopped)" aria-label="Close">✕</button></div>
 <div id="perf"></div>
 
+<script src="{{ asset('js/presence.js') }}"></script>
 <script src="{{ asset('js/core.js') }}"></script>
 <script src="{{ asset('js/scene.js') }}"></script>
 <script src="{{ asset('js/draw.js') }}"></script>

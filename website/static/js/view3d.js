@@ -36,9 +36,24 @@ function skyFractions() {
 // The zones are painted on the star backdrop with a coarse per-cell test (exact for any view, including the backdrop's
 // singular point), then smoothed by the browser; the boundary circles are drawn crisply on top.
 const visCv = document.createElement('canvas'), visCtx = visCv.getContext('2d');
+// Fast time skips: SPHEREx circles Earth every 98 minutes, so Earth's shadow on the sky (the slice SPHEREx can't see
+// right now) jumps to a new place every frame once time runs at hours per second - a flashing that is real but useless
+// (and unpleasant). From VIS_FAST_FROM of an orbit per frame the "Visible now" area eases into the WHOLE area SPHEREx can
+// see during its orbit (everything at least 91 deg from the Sun), which only turns slowly with the Sun; it is all of it
+// from VIS_FAST_FULL. At normal speeds it is the exact slice, as before.
+const VIS_FAST_FROM = 1/24, VIS_FAST_FULL = 1/8, VIS_FAST_EASE_S = 0.4;    // orbits per frame; seconds to ease in / out
+const visFast = {w: 0, t: 0, frameS: 1/60};
+function visFastWeight() {                                // 0: the exact slice now ... 1: the whole area seen over an orbit
+  const now = performance.now(), dt = visFast.t ? Math.min((now - visFast.t)/1000, 0.5) : 0; visFast.t = now;
+  if (dt > 0) visFast.frameS += (dt - visFast.frameS)*0.1;                   // (the real time per frame, smoothed)
+  const orbitsPerFrame = Math.abs(simRate())*visFast.frameS*1440/((snap && snap.period_min) || 98.4);
+  const goal = smooth(VIS_FAST_FROM, VIS_FAST_FULL, orbitsPerFrame);
+  visFast.w = dt ? visFast.w + (goal - visFast.w)*(1 - Math.exp(-dt/VIS_FAST_EASE_S)) : goal;
+  return visFast.w;
+}
 function drawVisibility() {
   if (!opt.cVisNow && !opt.cVisAll) return;
-  const g = visGeom(), SK = skyScale(), cell = 6, gw = Math.ceil(W/cell), gh = Math.ceil(H/cell);
+  const g = visGeom(), SK = skyScale(), cell = 6, gw = Math.ceil(W/cell), gh = Math.ceil(H/cell), fw = visFastWeight();
   if (visCv.width !== gw || visCv.height !== gh) { visCv.width = gw; visCv.height = gh; }
   const img = visCtx.createImageData(gw, gh), d = img.data, R0 = R[0], R1 = R[1], R2 = R[2];
   const rho = Math.acos(g.cosRho);
@@ -49,7 +64,8 @@ function drawVisibility() {
     const wEdge = cell*k/SK;
     const mSun = Math.acos(clamp(x*g.sun[0] + y*g.sun[1] + z*g.sun[2], -1, 1)) - SUN_LIMIT_DEG*D2R;   // > 0: farther than 91 deg from the Sun
     const cSun = clamp(mSun/wEdge + 0.5, 0, 1); if (cSun <= 0) continue;
-    const mE = Math.acos(clamp(x*g.toE[0] + y*g.toE[1] + z*g.toE[2], -1, 1)) - rho, cNow = clamp(mE/wEdge + 0.5, 0, 1);   // > 0: not behind Earth
+    const mE = fw < 1 ? Math.acos(clamp(x*g.toE[0] + y*g.toE[1] + z*g.toE[2], -1, 1)) - rho : 1;   // > 0: not behind Earth
+    const cNow = fw + (1 - fw)*clamp(mE/wEdge + 0.5, 0, 1);                                        // (fast: Earth's shadow eased out)
     const aAll = opt.cVisAll ? 16 : 0, al = opt.cVisNow ? cSun*(34*cNow + aAll*(1 - cNow)) : cSun*aAll;   // 34 = visible now, 16 = Sun limit only
     if (al < 0.5) continue;
     const o = (j*gw + i)*4; d[o] = 0; d[o+1] = 181; d[o+2] = 226; d[o+3] = Math.round(al);
@@ -58,7 +74,7 @@ function drawVisibility() {
   ctx.save(); ctx.imageSmoothingEnabled = true; ctx.drawImage(visCv, 0, 0, gw*cell, gh*cell); ctx.restore();
   ctx.lineWidth = 1.2;
   if (opt.cVisAll) { ctx.strokeStyle = '#ff9d6bcc'; ctx.setLineDash([7, 6]); ctx.beginPath(); drawGreatPath(smallCircle(g.sun, SUN_LIMIT_DEG, 180), SK); ctx.stroke(); ctx.setLineDash([]); }
-  if (opt.cVisNow) drawVisLabel(g, SK);
+  if (opt.cVisNow) drawVisLabel(fw > 0.5 ? {...g, cosRho: 2, noEarth: true} : g, SK, fw > 0.5);   // (cosRho 2: nothing is behind Earth)
 }
 // The "SPHEREx can see now" label belongs to the Visible now layer alone: it is on exactly when that layer is, whatever
 // else is switched on. It is pinned to the middle of the region on the SKY: the direction opposite the Sun, the centre of
@@ -69,7 +85,9 @@ function drawVisibility() {
 // stands on sky that can really be seen, and it moves smoothly as Earth passes (never a jump).
 const LABEL_EDGE_MARGIN = 6*D2R;
 function visCentre(g) {
-  const a = [-g.sun[0], -g.sun[1], -g.sun[2]], e = g.toE, rho = Math.acos(g.cosRho), limit = rho + LABEL_EDGE_MARGIN, cosA = clamp(dot(a, e), -1, 1);
+  const a = [-g.sun[0], -g.sun[1], -g.sun[2]];
+  if (g.noEarth) return a;                                                                 // (fast time: the whole area, Earth ignored)
+  const e = g.toE, rho = Math.acos(g.cosRho), limit = rho + LABEL_EDGE_MARGIN, cosA = clamp(dot(a, e), -1, 1);
   if (Math.acos(cosA) >= limit) return a;                                                  // not under Earth: the middle of the region
   let t = [a[0] - cosA*e[0], a[1] - cosA*e[1], a[2] - cosA*e[2]], tn = Math.hypot(...t);
   if (tn < 1e-4) { t = cross(e, g.sun); tn = Math.hypot(...t); }                         // Earth exactly behind it: slide sideways
@@ -80,14 +98,15 @@ function visCentre(g) {
 const visLabel = {rect: null, slot: 0, ui: [], dir: null, t: 0};   // last frame's rectangle (the names keep clear of it), the spot used, the panels, the smoothed sky position
 const LABEL_MARGIN = 28;          // px kept clear between the label and the edge of the screen
 const LABEL_SMOOTH_S = 0.25;      // seconds: much faster than the real orbit (98 min), so invisible at normal speeds, but it averages out the Earth sweeping past when time runs at days per second
-const LABEL_TEXT = 'SPHEREx can see now', LABEL_FONT = '12px system-ui', LABEL_DY = [4, -20, 28, -44, 52];     // spots, from the centre down and up
-function drawVisLabel(g, SK) {
+const LABEL_TEXT = 'SPHEREx can see now', LABEL_TEXT_FAST = 'SPHEREx can see (during each orbit)', LABEL_FONT = '12px system-ui', LABEL_DY = [4, -20, 28, -44, 52];     // spots, from the centre down and up
+function drawVisLabel(g, SK, fast = false) {
   visLabel.rect = null;
+  const text = fast ? LABEL_TEXT_FAST : LABEL_TEXT;
   const c = visCentre(g); if (!c) { visLabel.dir = null; return; }
   const now = performance.now(), dt = (now - visLabel.t)/1000; visLabel.t = now;
   if (!visLabel.dir || dt > 1) visLabel.dir = c;               // first frame, or the layer was off: no gliding
   else { const k = 1 - Math.exp(-dt/LABEL_SMOOTH_S), m = [0, 1, 2].map(i => visLabel.dir[i] + k*(c[i] - visLabel.dir[i])), n = Math.hypot(...m) || 1; visLabel.dir = [m[0]/n, m[1]/n, m[2]/n]; }
-  const a = visLabel.dir, w = measure(LABEL_FONT, LABEL_TEXT), h = 13;
+  const a = visLabel.dir, w = measure(LABEL_FONT, text), h = 13;
   const place = d => {                                       // where the label would stand on sky direction d: the first free spot, last frame's first
     const q = skyXY(toView(d), SK); if (!q) return null;     // (behind the view: no spot)
     for (let t = 0; t < LABEL_DY.length; t++) {
@@ -110,7 +129,7 @@ function drawVisLabel(g, SK) {
   }
   if (!spot) return;
   visLabel.slot = spot.s; visLabel.rect = spot.r; labelRects.push(spot.r);
-  ctx.font = LABEL_FONT; ctx.fillStyle = '#5fd6f0'; ctx.fillText(LABEL_TEXT, spot.lx, spot.ly);
+  ctx.font = LABEL_FONT; ctx.fillStyle = '#5fd6f0'; ctx.fillText(text, spot.lx, spot.ly);
 }
 
 // ============================================================================ 3D drawing ===
@@ -124,6 +143,7 @@ function draw3D() {
   drawVisibility();
   drawSkyTarget();
   drawAnalysed();
+  drawTrackPaths();
   drawAnaSpot();
   drawClickMark();
   const E = state.E, sp = state.spherex, wAU = W/s, orbitA = smooth(0.004, 0.03, wAU);

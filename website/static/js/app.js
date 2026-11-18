@@ -137,7 +137,12 @@ function initUI() {
   $('spinAxis').oninput = () => setTilt(+$('spinAxis').value);
   $('spinV').onclick = () => setTilt(0); $('spinH').onclick = () => setTilt(90); $('spinE').onclick = () => setTilt(0, true);
   $('gotoBtn').onclick = () => { const h = $('gotoPanel').hidden; $('gotoPanel').hidden = !h; $('gotoArrow').textContent = h ? '▴' : '▾'; if (h) $('gRA').focus(); };
-  $('gTarget').onchange = () => { const T = targets[+$('gTarget').value]; if (!T) return; const [ra, dec] = [T.ra, T.dec]; $('gRA').value = ra.toFixed(6); $('gDec').value = dec.toFixed(6);
+  $('gTarget').onchange = () => { const T = targets[+$('gTarget').value]; if (!T) return;
+    if (T.track) {                                                // an asteroid: where its orbit puts it on the date shown
+      const d = targetDir(T); if (!d) { $('gMsg').className = 'err'; $('gMsg').textContent = `The orbit of ${T.name} has not loaded yet: try again in a moment.`; return; }
+      T.shown = ecl2eq(d).map(v => +v.toFixed(6)); $('gRA').value = T.shown[0].toFixed(6); $('gDec').value = T.shown[1].toFixed(6);
+      $('gMsg').className = 'dim'; $('gMsg').textContent = `Asteroid: its position on the date shown, from its NASA/JPL orbit. The analysis follows it through its SPHEREx images from ${T.track.window.join(' to ')}.`; return; }
+    const [ra, dec] = [T.ra, T.dec]; $('gRA').value = ra.toFixed(6); $('gDec').value = dec.toFixed(6);
     $('gMsg').className = 'dim'; $('gMsg').textContent = T.pmra != null ? `ESA Gaia DR3 position at J${T.epoch}, moved with its proper motion to the date shown.` : 'Coordinates from the challenge text; not in Gaia, so not moved.'; };
   for (const id of ['gRA', 'gDec']) $(id).addEventListener('keydown', e => { if (e.key === 'Enter') goToTyped(); e.stopPropagation(); });
   $('gGo').onclick = goToTyped; $('gPix').oninput = showPatchInfo; showPatchInfo();
@@ -190,8 +195,10 @@ function initUI() {
   resize(); initUI(); zt = ztGoal = tFit(); $('zoom').value = zt;
   setJD(DATA_FIRST); sim.dir = 0;                              // open on the first day of SPHEREx data (paused, like "Jump to… First data")
   try { meta = await api('/api/meta'); } catch (e) { console.warn('meta', e); meta = {launch_jd: 2460746.6325, science_start_jd: 2460796.5, science_end_jd: 2461557.5, ephemeris: 'unavailable', de_start_jd: null}; }
-  loadSky(); loadSmallBodies(); loadTargets(); loadAnalysed();
+  loadSky(); loadSmallBodies(); loadTargets();
   requestAnimationFrame(frame);
+  await xarvisPage.hello(true);                                // a new visit clears the saved analyses first (presence.js)
+  loadAnalysed();
   reattachActive();                                            // an analysis still running (e.g. back from the About page)
 })();
 // Debug hooks: inspect or drive the viewer from the browser console (e.g. XARVIS.setJD(2460796.5)); also used by tests

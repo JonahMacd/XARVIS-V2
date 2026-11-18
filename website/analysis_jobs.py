@@ -12,8 +12,8 @@ same request finds its finished results again - also after a server restart.
                                                  'message', 'summary' (when done), 'error' (when failed)}
     active()         -> the running analysis    ({'job', 'status', 'done', 'total', 'message', 'request'}) or None
     stop()           -> stops the running one   (its partial files are removed)
-    reset()          -> stops every run and deletes every saved analysis (the page's "Stop & reset" button, and the
-                        first page load of a new browser session)
+    reset()          -> stops every run and deletes every saved analysis (the page's "Stop & reset" button, and a
+                        new visit: app.py, "visits")
     folder(job_id)   -> where its files are
 
 The pipeline is imported on first use, in the worker - the viewer itself starts without it (and still works if the

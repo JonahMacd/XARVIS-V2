@@ -602,7 +602,7 @@ class WebsiteTests(unittest.TestCase):
         import re
         html = self.client.get('/').get_data(as_text=True)
         scripts = re.findall(r'<script src="/static/(js/[\w.]+)\?v=(\d+)"', html)
-        self.assertEqual([name for name, _ in scripts], ['js/core.js', 'js/scene.js', 'js/draw.js', 'js/tracker.js',
+        self.assertEqual([name for name, _ in scripts], ['js/presence.js', 'js/core.js', 'js/scene.js', 'js/draw.js', 'js/tracker.js',
                                                          'js/view3d.js', 'js/analysis.js', 'js/app.js'])
         self.assertTrue(all(int(version) > 0 for _, version in scripts))      # (0 = the file is missing)
 

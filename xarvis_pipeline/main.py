@@ -169,12 +169,12 @@ def field_check(frames, coord, *, identify=True):
         return None, None
 
 
-def sky_map(frames, coord, *, field=None):
+def sky_map(frames, coord, *, field=None, target=None):
     """Name every object in the frames and find the new ones (skymap.py). Needs the full pixels. None if the
     reference services can't be reached (never stops the run)."""
     from .skymap import map_sky
     try:
-        return map_sky(frames, coord, field=field)
+        return map_sky(frames, coord, field=field, target=target)
     except RuntimeError as e:
         log.info(f'Sky map skipped: {e}')
         return None
@@ -218,7 +218,7 @@ def run_fixed_target(star, settings, max_images=cfg.MAX_IMAGES, show=True, zoom_
         tracked['field'], field = field_check(frames, now, identify=not want_map)
         sky = None
         if want_map:
-            sky = tracked['skymap'] = sky_map(frames, now, field=tracked['field'])
+            sky = tracked['skymap'] = sky_map(frames, now, field=tracked['field'], target=star)
             if sky is not None:
                 if tracked['field'] is None:
                     tracked['field'] = sky['catalog']

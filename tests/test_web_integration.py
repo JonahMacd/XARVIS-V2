@@ -580,14 +580,15 @@ class ViewerLayout(unittest.TestCase):
         body = js[js.index('function drawVisLabel'):js.index('// ====', js.index('function drawVisLabel'))]
         for name in ('cNames', 'cLines', 'placeLabel(', 'drawNames'):
             self.assertNotIn(name, body)
-        self.assertIn('if (opt.cVisNow) drawVisLabel(g, SK);', js)
+        self.assertRegex(js, r'if \(opt\.cVisNow\) drawVisLabel\(')               # drawn when Visible now is on, nothing else
+        self.assertIn('visFastWeight', js)       # fast time skips: the whole area seen over an orbit, not Earth's flashing shadow
         self.assertIn('labelRects = baseRects.slice();', js[js.index('function draw3D'):])
         self.assertNotIn('cx += i', js)                                            # the old on-screen centroid is gone
         self.assertIn('visCentre', js)
 
 
 class OneAtATime(unittest.TestCase):
-    """Only one analysis runs at a time; it can be stopped; "Stop & reset" and a new browser session clear everything."""
+    """Only one analysis runs at a time; it can be stopped; "Stop & reset" and a new visit clear everything."""
 
     def setUp(self):
         self.client = app.test_client()
@@ -681,20 +682,21 @@ class OneAtATime(unittest.TestCase):
         self.assertEqual(len(facts), 100)
         self.assertTrue(all(isinstance(f, str) and f.endswith('.') for f in facts))
 
-    def test_a_new_browser_session_starts_clean_but_the_about_page_keeps_them(self):
+    def saved(self):
+        return [a['job'] for a in self.client.get('/api/analyses').get_json()['analyses']]
+
+    def test_a_new_visit_starts_clean_and_other_pages_keep_the_analyses(self):
+        # (whether it IS a new visit is decided in the browser: static/js/presence.js)
         self.release.set()
         job = self.client.post('/api/analysis', json=PAYLOAD).get_json()['job']
         self.assertEqual(wait_for(self.client, job)['status'], 'done')
-        browser = app.test_client()                                                  # a new browser session
-        first = browser.get('/')
-        self.assertIn('xarvis_session=', first.headers.get('Set-Cookie', ''))
-        self.assertNotIn('Expires', first.headers.get('Set-Cookie', ''))           # a session cookie: gone with the browser
-        self.assertEqual(browser.get('/api/analyses').get_json(), {'analyses': []})   # reset on arrival
-        job = browser.post('/api/analysis', json=PAYLOAD).get_json()['job']
-        self.assertEqual(wait_for(browser, job)['status'], 'done')
-        self.assertEqual(browser.get('/about').status_code, 200)                    # to the About page and back
-        self.assertEqual(browser.get('/').status_code, 200)
-        self.assertEqual([a['job'] for a in browser.get('/api/analyses').get_json()['analyses']], [job])   # kept
+        for page in ('/', '/about'):                                            # loading a page never deletes them
+            self.assertEqual(self.client.get(page).status_code, 200)
+        self.assertEqual(self.saved(), [job])
+        self.assertIn('js/presence.js', self.client.get('/about').get_data(as_text=True))   # (the About page answers)
+        reply = self.client.post('/api/visit/new').get_json()                   # XARVIS closed and opened again
+        self.assertEqual(reply['reset']['deleted'], 1)
+        self.assertEqual(self.saved(), [])
 
 
 @unittest.skipUnless(os.environ.get('XARVIS_ONLINE'), 'needs the internet (NASA/IPAC IRSA): set XARVIS_ONLINE=1')

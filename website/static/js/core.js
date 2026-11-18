@@ -29,7 +29,7 @@ const txt = {};
 const setText = (id, v) => { if (txt[id] !== v) { txt[id] = v; $(id).textContent = v; } };
 const setHTML = (id, v) => { if (txt[id] !== v) { txt[id] = v; $(id).innerHTML = v; } };
 const opt = {};
-for (const id of ['cStars','cLines','cOrbits','cBelts','cVisNow','cVisAll','cAnalysed']) {
+for (const id of ['cStars','cLines','cOrbits','cTrackPath','cBelts','cVisNow','cVisAll','cAnalysed']) {
   opt[id] = $(id).checked; $(id).addEventListener('change', () => { opt[id] = $(id).checked; opt.cNames = opt.cLines; });
 }
 opt.cNames = opt.cLines;

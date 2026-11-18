@@ -32,7 +32,12 @@ function targetEqAt(T, jd) {                                      // [ra, dec] i
   const yrs = (jd - 2451545.0)/365.25 + 2000 - T.epoch, k = D2R/3.6e6*yrs, v = norm([0, 1, 2].map(i => u[i] + k*(T.pmra*e[i] + T.pmdec*nn[i])));
   return [(Math.atan2(v[1], v[0])/D2R + 360) % 360, Math.asin(v[2])/D2R];
 }
-const targetDir = (T, jd = sim.jd) => { const [ra, dec] = targetEqAt(T, jd); return eq2ecl(ra*D2R, dec*D2R); };
+// an asteroid target (T.track, e.g. 433 Eros) has no fixed position: it is where its JPL orbit (small_bodies.json, the
+// Track objects list) puts it on the date shown, as seen from Earth - null until that list has loaded
+function targetBody(T) { const key = T.name.toLowerCase(); return catalog.find(e => e.o && (e.key === key || e.key.startsWith(key + ' ('))); }
+const targetDir = (T, jd = sim.jd) => {
+  if (T.track) { const e = targetBody(T), p = e && state && e.pos(); return p ? geoDir(p) : null; }
+  const [ra, dec] = targetEqAt(T, jd); return eq2ecl(ra*D2R, dec*D2R); };
 async function loadTargets() {
   try { targets = (await api('/static/targets.json')).targets;
     $('gTarget').innerHTML = '<option value="">Choose a target…</option>' + targets.map((t, i) => `<option value="${i}">${esc(t.name)}</option>`).join(''); }
@@ -46,6 +51,7 @@ function lookToward(f) {                                          // turn the vi
     R = lookAt(norm(v), [0, 0, 1]); return k >= 1; };
 }
 function showSkyTarget(T, hw) {
+  if (!targetDir(T)) { $('gMsg').className = 'err'; $('gMsg').textContent = `The orbit of ${T.name} has not loaded yet: try again in a moment.`; return; }
   skyTarget = {T, hw}; lookToward(targetDir(T));
   $('gotoChip').innerHTML = `<span class="chip"><b>${esc(T.name)}</b><button class="ghost cf" id="gReopen" title="Open the analysis again">Open</button><button class="ghost cx" id="gClear" title="Remove the marker">✕</button></span>`;
   $('gReopen').onclick = () => openAnalysisDir(targetDir(T), T, hw); $('gClear').onclick = () => { skyTarget = null; $('gotoChip').innerHTML = ''; };
@@ -56,12 +62,13 @@ function goToTyped() {
   if (ra == null || dec == null) { $('gMsg').className = 'err'; $('gMsg').textContent = ra == null ? 'Right ascension not understood: try 08h55m10.8s, 08 55 10.8 or 133.795 (degrees).' : 'Declination not understood: try -7d14m42.5s, -07 14 42.5 or -7.245.'; return; }
   $('gMsg').className = 'dim';
   const T0 = i !== '' ? targets[+i] : null;
-  const same = T0 && Math.abs(ra - T0.ra) < 1e-4 && Math.abs(dec - T0.dec) < 1e-4;      // untouched preset: keep its Gaia motion
+  const [ra0, dec0] = T0 ? T0.shown || [T0.ra, T0.dec] : [];   // (an asteroid: where it was put when chosen)
+  const same = T0 && Math.abs(ra - ra0) < 1e-4 && Math.abs(dec - dec0) < 1e-4;      // untouched preset: keep its Gaia motion / orbit
   showSkyTarget(same ? T0 : {name: `RA ${fmtRA(ra, false)} · Dec ${fmtDec(dec, false)}`, ra, dec, typed: true, source: 'typed coordinates (J2000)'}, hw);
 }
 function drawSkyTarget() {
   if (!skyTarget) return;
-  const SK = skyScale(), T = skyTarget.T, d = targetDir(T), q = skyXY(toView(d), SK); if (!q) return;
+  const SK = skyScale(), T = skyTarget.T, d = targetDir(T), q = d && skyXY(toView(d), SK); if (!q) return;
   const half = Math.max(9, skyTarget.hw*D2R*SK), pulse = 3*Math.sin(performance.now()/300);
   ctx.strokeStyle = '#5fd6f0'; ctx.lineWidth = 1.6; ctx.strokeRect(q[0] - half, q[1] - half, 2*half, 2*half);
   ctx.beginPath(); for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) { ctx.moveTo(q[0] + dx*(half + 4 + pulse), q[1] + dy*(half + 4 + pulse)); ctx.lineTo(q[0] + dx*(half + 14 + pulse), q[1] + dy*(half + 14 + pulse)); } ctx.stroke();
@@ -85,6 +92,7 @@ function analysisPayload(dir, T = null, hw = 0.25) {
     patch: {half_width_deg: hw, size: (2*hw*60).toFixed(0) + ' x ' + (2*hw*60).toFixed(0) + ' arcmin'},
     named_target: T ? {name: T.name, source: T.source || null, gaia_dr3: T.gaia_dr3 || null, ra_deg_at_epoch: T.ra, dec_deg_at_epoch: T.dec, epoch: T.epoch ?? null,
                        pmra_mas_yr: T.pmra ?? null, pmdec_mas_yr: T.pmdec ?? null, parallax_mas: T.parallax ?? null, gaia_g_mag: T.g ?? null} : null,
+    ...(T && T.track ? {track: {...T.track, preset: true}} : {}),     // an asteroid target: followed along its JPL Horizons path
     spherex: {geocentric_km_j2000_equatorial: ecl2eqVec(sp.off).map(v => +(v*AU_KM).toFixed(1)), altitude_km: +sp.altitude_km.toFixed(1), orbit_source: sp.source},
   };
 }
@@ -114,7 +122,7 @@ const TL_TIPS = [
   'Researchers: the per-image flags (TRANSIENT, OUTLIER, saturated, bad pixels) tell you which measurements to trust before you download the data from IRSA.',
   'Variable stars: each image\'s brightness is compared with the object\'s own spectrum; a "BRIGHTNESS CHANGE" in the frame title marks an image that stands out.',
   'Every position is checked against ESA Gaia DR3: the "Positions vs Gaia" line shows how well SPHEREx\'s pointing matches, typically well under one 6.15″ pixel.',
-  'The first look at a patch downloads from NASA/IPAC IRSA (seconds to a minute or two). Asking again is instant: the results are kept until you reset them or start a new browser session.',
+  'The first look at a patch downloads from NASA/IPAC IRSA (seconds to a minute or two). Asking again is instant: the results are kept until you reset them or close XARVIS and open it again.',
   'NASA/IPAC IRSA is sometimes busy and answers "502". XARVIS retries automatically; if it still fails, "Try again" a minute later usually works.',
   'More images (the "Images" menu) cover more of the survey\'s visits but take longer to collect. 8 (the default) is quickest; 24 or 50 show more of the survey.',
   'Keyboard, once the images are in: ← → step through them, Space plays and pauses, Home / End jump to the first / last.'];
@@ -163,10 +171,11 @@ function tlReset() {
 function tlStartText() {                                       // what "Begin" will do: the patch, how many images, how long
   const P = tl.payload; if (!P) return;
   const count = $('tlCount').value, px = Math.round(2*P.patch.half_width_deg*3600/SPHEREX_PIX);
+  if (P.track && P.track.preset) { $('tlStartText').textContent = `${count === 'all' ? 'Every' : count} SPHEREx image${count === '1' ? '' : 's'} of ${P.track.name} from ${P.track.window.join(' to ')}, each centred on where NASA/JPL Horizons puts it at that moment. ${tlTimeText(count)}`; return; }
   $('tlStartText').textContent = `${count === 'all' ? 'Every' : count} SPHEREx image${count === '1' ? '' : 's'} of a ${px} × ${px} pixel patch (${(px*SPHEREX_PIX/60).toFixed(1)}′) centred on this point, spread over the whole survey. ${tlTimeText(count)}`;
 }
 function tlReady(P) {                                          // a new point: show what will be analysed and wait for "Begin"
-  tl.req++; tlReset(); tl.payload = P; if (!P.track) tl.base = P; tl.sel = null; tl.state = 'ready'; tlTrackBar();
+  tl.req++; tlReset(); tl.payload = P; if (!P.track || P.track.preset) tl.base = patchOnly(P); tl.sel = null; tl.state = 'ready'; tlTrackBar();
   $('tlStart').hidden = false; tlStartText(); tlTimeHint(); anaStateSet('ready to analyse');
 }
 function tlProgress(msg, done, total) {                         // no total yet: a moving bar, so the page never looks frozen
@@ -224,7 +233,7 @@ async function requestAnalysis(payload) {
   if (analysisBusy() || !payload || $('anaViz').hidden) return null;       // (one at a time; no image box: nothing to show)
   const id = ++tl.req; tlReset();
   payload = {...payload}; tl.payload = payload;
-  if (!payload.track) { tl.base = payload; tl.sel = null; }            // the patch itself (not an object picked in it)
+  if (!payload.track || payload.track.preset) { tl.base = patchOnly(payload); tl.sel = null; }   // the patch itself (not an object picked in it)
   tl.runName = payload.track ? payload.track.name : $('anaTitle').textContent;
   const count = $('tlCount').value; payload.max_images = count === 'all' ? null : +count;
   tl.state = 'loading'; tlTrackBar(); syncBusyUI();
@@ -365,7 +374,25 @@ function svgEl(tag, attrs, parent) { const e = document.createElementNS(SVGNS, t
 function tlDraw() {
   const svg = $('tlSvg'), f = tl.frames[tl.i]; if (!f) return;
   svg.replaceChildren();
-  if ($('tlMapOn').checked && f.objects) for (const o of f.objects) {
+  if ($('tlMapOn').checked && f.objects) tlMapDraw(svg, f.objects);
+  // the circles: the analysed object, or the object picked in the images (red = this frame, blue = its first sighting)
+  let red = f.marks && f.marks.red, blue = f.marks && f.marks.blue;
+  if (tl.sel) { const O = tl.S.objects[tl.sel], here = (f.objects || []).find(o => o.id === tl.sel);
+    red = here ? [here.x, here.y] : null;
+    const first = O && tl.frames[O.frames[0] - 1], at = first && (first.objects || []).find(o => o.id === tl.sel); blue = at ? [at.x, at.y] : null; }
+  const R = (f.marks && f.marks.radius) || 16, RB = (f.marks && f.marks.blue_radius) || 21;
+  if (blue) svgEl('circle', {cx: blue[0], cy: blue[1], r: RB, stroke: '#00bfff', 'stroke-width': 2.2, 'stroke-dasharray': '7 5', fill: 'none', 'pointer-events': 'none'}, svg);
+  if (red) svgEl('circle', {cx: red[0], cy: red[1], r: R, stroke: '#ff0000', 'stroke-width': 2.2, fill: 'none', 'pointer-events': 'none'}, svg);
+}
+// The sky map of one frame: every marker, then the names - NEW objects first, then named stars, asteroids / comets
+// and planets, each placed where it covers no other name. Gaia DR3 (+) and CatWISE (x) stars have no name printed
+// (hover or click one to see its catalog id).
+const LABEL_H = 13, labelW = t => 6.2*t.length + 2;
+function tlMapDraw(svg, objects) {
+  const W = +tl.S.image_px, taken = [], labels = [];
+  const free = b => b[0] >= 1 && b[1] >= 1 && b[0] + b[2] <= W - 1 && b[1] + b[3] <= W - 1 &&
+    taken.every(t => b[0] >= t[0] + t[2] || t[0] >= b[0] + b[2] || b[1] >= t[1] + t[3] || t[1] >= b[1] + b[3]);
+  for (const o of objects) {
     const g = svgEl('g', {class: 'o'}, svg), c = o.kind === 'star' ? MAP_COLOUR[o.named ? 'Hipparcos' : o.source] || '#fff' : MAP_COLOUR[o.kind] || '#fff', x = o.x, y = o.y;
     const line = {stroke: c, 'stroke-width': 1.6, fill: 'none'};
     if (o.kind === 'star' && o.named) svgEl('path', {d: starPath(x, y, 7), ...line}, g);
@@ -375,25 +402,28 @@ function tlDraw() {
     else if (o.kind === 'edge') svgEl('circle', {cx: x, cy: y, r: 6, ...line, 'stroke-width': 1.2}, g);   // at the image edge: unchecked
     else if (o.kind === 'new') { svgEl('circle', {cx: x, cy: y, r: 13, stroke: c, 'stroke-width': 7, 'stroke-opacity': 0.25, fill: 'none'}, g); svgEl('circle', {cx: x, cy: y, r: 13, stroke: c, 'stroke-width': 2.6, fill: 'none'}, g); }
     else svgEl('path', {d: `M${x} ${y-7}L${x+7} ${y}L${x} ${y+7}L${x-7} ${y}Z`, ...line}, g);        // small body / planet
-    if (o.kind === 'new') {                                                // labelled, impossible to miss
-      const t = o.label, w = 6.6*t.length + 8, lx = Math.min(x + 16, +tl.S.image_px - w - 2), ly = Math.max(y - 26, 2);
+    svgEl('title', {}, g).textContent = o.label;
+    const rank = o.kind === 'new' ? 0 : (o.kind === 'star' && o.named) || o.kind === 'small body' || o.kind === 'planet' ? 1 : -1;
+    if (rank >= 0) taken.push([x - 8, y - 8, 16, 16]);                     // names don't cover these markers
+    if (rank >= 0) labels.push({o, g, c, rank});
+  }
+  labels.sort((a, b) => a.rank - b.rank || (b.o.detected - a.o.detected) || ((a.o.mag ?? 99) - (b.o.mag ?? 99)));
+  for (const {o, g, c, rank} of labels) {
+    const x = o.x, y = o.y;
+    if (rank === 0) {                                                      // NEW: labelled, impossible to miss
+      const t = o.label, w = 6.6*t.length + 8, lx = Math.min(x + 16, W - w - 2), ly = Math.max(y - 26, 2);
       svgEl('line', {x1: x, y1: y, x2: lx, y2: ly + 9, stroke: c, 'stroke-width': 1.4}, g);
       svgEl('rect', {x: lx, y: ly, width: w, height: 17, rx: 3, fill: c, 'fill-opacity': 0.95}, g);
       svgEl('text', {x: lx + 4, y: ly + 12.5, class: 'tag'}, g).textContent = t;
-    } else if ((o.kind === 'star' && o.named) || o.kind === 'small body' || o.kind === 'planet') {
-      const name = o.kind === 'star' ? o.label : (o.label.split('(')[0].trim() || o.label) + (o.detected ? '' : ' (not detected)');
-      svgEl('text', {x: x + 9, y: y - 7, fill: c}, g).textContent = name;
+      taken.push([lx, ly, w, 17]); continue;
     }
-    svgEl('title', {}, g).textContent = o.label;
+    const name = o.kind === 'small body' || o.kind === 'planet' ? (o.label.split('(')[0].trim() || o.label) + (o.detected ? '' : ' (not detected)') : o.label;
+    const w = labelW(name), spots = [[x + 9, y - 17], [x + 9, y + 4], [x - 9 - w, y - 17], [x - 9 - w, y + 4], [x - w/2, y - 22], [x - w/2, y + 9]]
+      .map(([lx, ly]) => [lx, ly, w, LABEL_H]);
+    const box = spots.find(free) || spots[0];                               // a name always shows
+    taken.push(box);
+    svgEl('text', {x: box[0], y: box[1] + LABEL_H - 3, fill: c}, g).textContent = name;
   }
-  // the circles: the analysed object, or the object picked in the images (red = this frame, blue = its first sighting)
-  let red = f.marks && f.marks.red, blue = f.marks && f.marks.blue;
-  if (tl.sel) { const O = tl.S.objects[tl.sel], here = (f.objects || []).find(o => o.id === tl.sel);
-    red = here ? [here.x, here.y] : null;
-    const first = O && tl.frames[O.frames[0] - 1], at = first && (first.objects || []).find(o => o.id === tl.sel); blue = at ? [at.x, at.y] : null; }
-  const R = (f.marks && f.marks.radius) || 16, RB = (f.marks && f.marks.blue_radius) || 21;
-  if (blue) svgEl('circle', {cx: blue[0], cy: blue[1], r: RB, stroke: '#00bfff', 'stroke-width': 2.2, 'stroke-dasharray': '7 5', fill: 'none', 'pointer-events': 'none'}, svg);
-  if (red) svgEl('circle', {cx: red[0], cy: red[1], r: R, stroke: '#ff0000', 'stroke-width': 2.2, fill: 'none', 'pointer-events': 'none'}, svg);
 }
 function tlClick(e) {                                         // the nearest object within reach, or empty sky: back to the target
   const f = tl.frames[tl.i], svg = $('tlSvg'), r = svg.getBoundingClientRect(), W = +tl.S.image_px;
@@ -425,10 +455,11 @@ function tlKeyText() {                                         // the circle leg
   spans[0].lastChild.textContent = O ? `${O.label} in this image` : tl.circles.red;
   spans[1].lastChild.textContent = O ? `${O.label} at its first sighting` : tl.circles.blue;
 }
+function patchOnly(P) { const {track, ...rest} = P; return rest; }   // a request without the object it tracks: the patch
 function tlTrackBar() {                                        // "Tracking X" with the way back to the patch
   const P = tl.payload, on = !!(P && P.track);
   $('tlTrack').hidden = !on; if (!on) return;
-  $('tlTrack').innerHTML = `<span>Tracking <b>${esc(P.track.name)}</b>, picked in the images of this patch</span><button id="tlBackBase">← Back to the patch</button>`;
+  $('tlTrack').innerHTML = `<span>Tracking <b>${esc(P.track.name)}</b>, ${P.track.preset ? `followed along its path (${esc(P.track.window.join(' to '))})` : 'picked in the images of this patch'}</span><button id="tlBackBase">← ${P.track.preset ? 'This patch only' : 'Back to the patch'}</button>`;
   $('tlBackBase').disabled = analysisBusy();                    // (one analysis at a time)
   $('tlBackBase').onclick = () => requestAnalysis(tl.base);
 }
@@ -647,6 +678,9 @@ function openAnalysisDir(dir, T, hw, saved = null, opts = {}) {
       ['Moves during the survey', `${mv.toFixed(1)}″ ≈ ${(mv/SPHEREX_PIX).toFixed(1)} SPHEREx pixels`]].map(row).join('');
     adv.push(...(T.note ? [['Note', esc(T.note)]] : []), ['Proper motion', pm.toFixed(3) + '″ per year'],
       ['Distance', T.parallax > 0 ? (1000/T.parallax).toFixed(T.parallax > 100 ? 2 : 0) + ' pc · ' + (3261.56/T.parallax).toFixed(T.parallax > 100 ? 2 : 0) + ' light-years' : '—']);
+  } else if (T && T.track) {
+    $('anaTarget').innerHTML = [['Orbit', esc(T.source || 'NASA/JPL')], ['Images searched', esc(T.track.window.join(' to '))]].map(row).join('');
+    adv.push(...(T.note ? [['Note', esc(T.note)]] : []), ['Position', 'moves every day: shown where its orbit puts it on the date shown']);
   } else if (T && !T.typed) {
     $('anaTarget').innerHTML = row(['Source', esc(T.source || '')]);
     adv.push(...(T.note ? [['Note', esc(T.note)]] : []), ['Proper motion', 'not in Gaia: position not moved']);
@@ -657,7 +691,7 @@ function openAnalysisDir(dir, T, hw, saved = null, opts = {}) {
   const inSpan = inDataSpan(sim.jd);
   $('anaVis').className = vis.visible_now ? 'ok' : 'no';
   $('anaVis').innerHTML = vis.visible_now ? '' : `<span>${vis.behind_earth && vis.sun_limit_ok ? 'Earth is in the way at this moment.' : `It is only ${t.sun_elongation_deg.toFixed(0)}° from the Sun; SPHEREx never points closer than 91°.`} ${nx || ''}</span>`;
-  $('anaViz').hidden = !opts.reattach && (!vis.visible_now || !inSpan);   // no image box outside SPHEREx's view or the data dates (a run reattached to: always)
+  $('anaViz').hidden = !opts.reattach && !(T && T.track) && (!vis.visible_now || !inSpan);   // (an asteroid: its images are searched over its time window, not this date)   // no image box outside SPHEREx's view or the data dates (a run reattached to: always)
   $('ana').classList.toggle('noviz', $('anaViz').hidden);      // then the data alone, in one column
   $('anaMini').hidden = true;                                  // (a new point replaces a minimized analysis)
   if (!inSpan) { $('anaVis').className = 'no'; $('anaVis').innerHTML += `<span class="span">No SPHEREx images exist for this date: its data run from ${utc(DATA_FIRST)} to ${utc(dataLatest())}. Use “Jump to…” in the time bar to go there.</span>`; }

@@ -18,10 +18,12 @@ let catalog = [], tracked = new Map(), focusId = null, lookupCls = null, candida
 function smallEntry(o, k) {
   const D = o.D[k], H = o.H[k], f = o.flags[k];
   return {id: o.key + ':' + k, name: o.name[k], type: o.key, o, k, H, D: !isNaN(D) ? D : !isNaN(H) ? estD(H) : null, sizeKnown: !isNaN(D),
-          numbered: f[0] === 'n', neo: f.includes('N'), pha: f.includes('P'), unknown: o.key === 'candidate', pos: () => keplerXYZ(o, k, sim.jd, [0, 0, 0])};
+          numbered: f[0] === 'n', neo: f.includes('N'), pha: f.includes('P'), unknown: o.key === 'candidate', pos: () => keplerXYZ(o, k, sim.jd, [0, 0, 0]),
+          posAt: jd => keplerXYZ(o, k, jd, [0, 0, 0])};
 }
 function buildCatalog() {
-  catalog = PLANETS.map(n => ({id: 'pl:' + n, name: n, type: 'planet', D: 2*RADIUS_KM[n], sizeKnown: true, numbered: true, pos: () => state && state.byName[n].pos}));
+  catalog = PLANETS.map(n => ({id: 'pl:' + n, name: n, type: 'planet', D: 2*RADIUS_KM[n], sizeKnown: true, numbered: true, pos: () => state && state.byName[n].pos,
+                               posAt: n === 'Earth' ? null : jd => kepler(n, (jd - J2000)/36525)}));
   catalog.push({id: 'moon', name: 'Moon', type: 'moon', D: 2*RADIUS_KM.Moon, sizeKnown: true, numbered: true, pos: () => state && state.byName.Moon ? state.byName.Moon.pos : null});
   for (const o of [...(small ? small.cls : []), lookupCls, candidateCls]) if (o) for (let k = 0; k < o.n; k++) catalog.push(smallEntry(o, k));
   for (const e of catalog) e.key = e.name.toLowerCase();
@@ -110,6 +112,47 @@ function drawTracked(c, s) {
     ctx.fillStyle = '#ffd27a'; ctx.fillText(e.name, x + 20, y - 9);
     addHit(x, y, 14, 0.7, () => trackTip(e));
   }
+}
+// The path of every tracked object across the sky, as seen from Earth (layer "Sky paths of tracked objects"): where its
+// orbit puts it PATH_DAYS either side of the date shown, a dot every PATH_DOT_DAYS. The same idea as the path an
+// analysed asteroid's images followed (drawAnalysed), but for anything in Track objects and before any analysis.
+// Planets: JPL mean elements; asteroids / comets / candidates: their two-body orbit. (Earth itself, the Moon and
+// SPHEREx have no path here.)
+const PATH_DAYS = 60, PATH_STEP_DAYS = 2, PATH_DOT_DAYS = 10;
+function skyPathAt(e, jd) {
+  const p = e.posAt(jd), E = kepler('Earth', (jd - J2000)/36525);
+  return norm([p[0] - E[0], p[1] - E[1], p[2] - E[2]]);
+}
+function drawTrackPaths() {
+  if (!opt.cTrackPath || !tracked.size || !state) return;
+  const SK = skyScale(), col = '#ffb81c', font = '10px system-ui';
+  ctx.save(); ctx.lineWidth = 1.4; ctx.font = font;
+  for (const e of tracked.values()) {
+    if (!e.posAt) continue;
+    const pts = [];
+    for (let d = -PATH_DAYS; d <= PATH_DAYS; d += PATH_STEP_DAYS) { const dir = skyPathAt(e, sim.jd + d); pts.push({d, dir, q: skyXY(toView(dir), SK)}); }
+    ctx.strokeStyle = col; ctx.globalAlpha = 0.85; ctx.setLineDash([5, 4]); ctx.beginPath();
+    let prev = null;
+    for (const pt of pts) {                                       // (broken where it leaves the view or jumps across it)
+      if (pt.q && prev && Math.hypot(pt.q[0] - prev[0], pt.q[1] - prev[1]) < Math.max(W, H)/3) ctx.lineTo(pt.q[0], pt.q[1]);
+      else if (pt.q) ctx.moveTo(pt.q[0], pt.q[1]);
+      prev = pt.q;
+    }
+    ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha = 1;
+    for (const pt of pts) {
+      if (!pt.q || pt.d % PATH_DOT_DAYS) continue;
+      const now = pt.d === 0, jd = sim.jd + pt.d;
+      ctx.fillStyle = col; ctx.beginPath(); ctx.arc(pt.q[0], pt.q[1], now ? 4 : 2.4, 0, 7); ctx.fill();
+      if (now) { ctx.strokeStyle = col; ctx.beginPath(); ctx.arc(pt.q[0], pt.q[1], 7, 0, 7); ctx.stroke(); }
+      if (Math.abs(pt.d) === PATH_DAYS) { ctx.fillStyle = '#ffd27a'; ctx.fillText(fmtDate(jd, false).slice(0, 10), pt.q[0] + 6, pt.q[1] - 5); }
+      addHit(pt.q[0], pt.q[1], 6, 0.5, () => tipHTML(esc(e.name), 'sky path', [['Date', fmtDate(jd, false).slice(0, 10) + (now ? ' (the date shown)' : ` (${pt.d > 0 ? '+' : ''}${pt.d} days)`)],
+        ['RA / Dec from Earth', fmtRADec(pt.dir)], ['SPHEREx can see it then', now ? (visibilityOf(pt.dir).visible_now ? 'yes' : 'no') : 'move the time there to see']],
+        'Where its orbit puts it as seen from Earth. Dots every ' + PATH_DOT_DAYS + ' days.'));
+    }
+    const end = pts[pts.length - 1].q;
+    if (end) { ctx.fillStyle = '#ffd27a'; ctx.font = 'bold 11px system-ui'; ctx.fillText(e.name, end[0] + 6, end[1] + 12); ctx.font = font; }
+  }
+  ctx.restore();
 }
 function trackTip(e) {
   const p = e.pos(); if (!p) return tipHTML(esc(e.name), 'tracked', [], 'Not shown at this time or speed.');

@@ -33,7 +33,9 @@ API
     /api/analysis/<job>/<name>.png  one of its images (frame_1.png ...)
     /api/analyses                   every finished analysis, drawn on the sky by the viewer
     /api/analysis/active            the analysis running now (or null); POST /api/analysis/stop stops it
-    POST /api/analyses/reset        delete the saved analyses (a new browser session also stops the running one)
+    POST /api/analyses/reset        delete the saved analyses (a new visit also stops the running one)
+    POST /api/visit/new             a new visit (the viewer opened, no other XARVIS tab open): start from a clean
+                                    slate (see "visits" below)
     /api/pipeline/...               the pipeline's own JSON API (status, targets, lookup, jobs, saved results,
                                     candidates, paths; every route is listed in xarvis_pipeline/web_blueprint.py)
 """
@@ -339,22 +341,28 @@ def spherex_snapshot(jd):
             "source": f"APPROXIMATE orbit model ({why}); official orbit parameters, position along the orbit unknown"}
 
 
-# ------------------------------------------------------------------- routes ---
-SESSION_COOKIE = "xarvis_session"
+# ------------------------------------------------------------------- visits ---
+# A new visit starts from a clean slate: every running analysis is stopped and the saved ones are deleted. A visit is
+# NOT told by a browser session cookie: Chrome / Edge keep those after the window is closed (Edge keeps running in the
+# background; "continue where you left off" restores them), so the site never reset. Instead the viewer's script
+# (static/js/presence.js) decides in the browser, which knows which XARVIS tabs are open, and then asks for the reset
+# here: a new visit is the viewer opening with no other XARVIS tab open, and not just coming back from the About page
+# or a reload.
 app.config.setdefault("XARVIS_RESET_ON_NEW_SESSION", True)
 
 
+@app.route("/api/visit/new", methods=["POST"])
+def visit_new():
+    """A new visit (presence.js): stop the running analysis and delete the saved ones. Returns {'reset': {'stopped',
+    'deleted'}} (None when XARVIS_RESET_ON_NEW_SESSION is off)."""
+    return jsonify({"reset": analysis_jobs.reset() if app.config["XARVIS_RESET_ON_NEW_SESSION"] else None})
+
+
+# ------------------------------------------------------------------- routes ---
 @app.route("/")
 def index():
-    """The viewer. The first visit of a new browser session starts from a clean slate: every running analysis is
-    stopped and the saved ones are deleted. A session cookie (no expiry: the browser drops it when it closes) marks
-    the session, so going to the About page and back keeps the analyses."""
-    response = app.make_response(render_template("index.html"))
-    if not request.cookies.get(SESSION_COOKIE):
-        if app.config["XARVIS_RESET_ON_NEW_SESSION"]:
-            analysis_jobs.reset()
-        response.set_cookie(SESSION_COOKIE, os.urandom(8).hex(), httponly=True, samesite="Lax")
-    return response
+    """The viewer. Whether this is a new visit (clean slate) is decided by its script (visits above)."""
+    return render_template("index.html")
 
 
 @app.route("/favicon.ico")
